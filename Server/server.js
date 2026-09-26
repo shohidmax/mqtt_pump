@@ -39,7 +39,7 @@ const wss = new WebSocket.Server({ server });
 const MQTT_BROKER_1 = process.env.MQTT_PRIMARY || 'mqtt://mosquitto-muthosech.espserver.site:1883';
 const MQTT_BROKER_2 = process.env.MQTT_SECONDARY || 'mqtt://mosquitto-muthosech.espserver.site:1883';
 
-const mqttClient = mqtt.connect([MQTT_BROKER_1, MQTT_BROKER_2], {
+const mqttClient = mqtt.connect(MQTT_BROKER_1, {
     clientId: 'nodejs_consumer_' + Math.random().toString(16).substr(2, 8),
     clean: true,
     connectTimeout: 4000,
