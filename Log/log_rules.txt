@@ -1,0 +1,17 @@
+# Project Logging Rules (Mutho-Sech)
+
+All changes made to the project across any directory (`Server`, `Dashboard`, `APP`, `Arduino`, etc.) must be properly documented in this `Log` directory.
+
+## How to Update
+- Every time a new feature is added, a bug is fixed, or a file is changed, an entry should be added to the `CHANGELOG.md` file.
+- Describe the task, what was added/removed, and which folders were affected.
+
+## Which Files Change
+- The changelog must state exactly which files were modified (e.g., `Dashboard/index.html`, `Server/package.json`).
+
+## When and Why to Change
+- **When:** Immediately after a task or feature is completed.
+- **Why:** To keep track of the project's history, understand what caused a bug if something breaks, and help other developers (or yourself) remember the progress.
+
+## Metrics (How Many Files / Lines)
+- If possible, log a summary of how many files were touched or how significant the change was.
