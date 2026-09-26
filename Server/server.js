@@ -36,8 +36,8 @@ let isEspOnline = false;
 const wss = new WebSocket.Server({ server });
 
 // --- MQTT Consumer Setup (HA Architecture) ---
-const MQTT_BROKER_1 = process.env.MQTT_PRIMARY || 'mqtt://mosquitto-muthosech.espserver.site:1883';
-const MQTT_BROKER_2 = process.env.MQTT_SECONDARY || 'mqtt://mosquitto-muthosech.espserver.site:1883';
+const MQTT_BROKER_1 = process.env.MQTT_PRIMARY || 'wss://mosquitto-muthosech.espserver.site:443';
+const MQTT_BROKER_2 = process.env.MQTT_SECONDARY || 'wss://mosquitto-muthosech.espserver.site:443';
 
 const mqttClient = mqtt.connect(MQTT_BROKER_1, {
     clientId: 'nodejs_consumer_' + Math.random().toString(16).substr(2, 8),
