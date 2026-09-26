@@ -3,6 +3,7 @@
 // =================================================================
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
