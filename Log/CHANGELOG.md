@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-26 (Motor Control & MQTT Fixes)
+- **Server/.env**: Replaced failing `wss://mosquitto-muthosech.espserver.site:443` with direct TCP `mqtt://mosquitto-muthosech.espserver.site:1883`, enabling Node.js server to successfully connect and forward commands.
+- **Server/test_on.js & test_off.js**: Changed command payloads from `{ command: "ON" }` / `"OFF"` to `{ type: "command", command: "RELAY_1" }` and `"RELAY_2"`.
+- **Arduino/v3.ino**: Added dual command support so both `"RELAY_1"`/`"ON"` and `"RELAY_2"`/`"OFF"` trigger relays, plus Serial debug prints for incoming commands.
+
 ## 2026-09-26 (Deployment & MQTT Fixes)
 - **Infrastructure**: Fixed Coolify Mosquitto deployment issues. Switched from default buggy template to a standalone custom `Dockerfile` mapped to ports 1883 (MQTT) and 9001 (WebSockets) via Traefik.
 - **Server**: Verified dual connection (Node.js and ESP32) to the new Mosquitto broker (`mosquitto-muthosech.espserver.site`).

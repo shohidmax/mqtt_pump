@@ -143,13 +143,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, message);
         if (!error) {
-            String command = doc["command"];
-            if (command == "RELAY_1") {
+            String command = doc["command"].as<String>();
+            Serial.printf("Executing command: %s\n", command.c_str());
+            if (command == "RELAY_1" || command == "ON") {
                 digitalWrite(RELAY_1, HIGH);
                 relay1_timer = millis();
-            } else if (command == "RELAY_2") {
+                Serial.println("RELAY_1 (START) Triggered!");
+            } else if (command == "RELAY_2" || command == "OFF") {
                 digitalWrite(RELAY_2, HIGH);
                 relay2_timer = millis();
+                Serial.println("RELAY_2 (STOP) Triggered!");
             } else if (command == "RESET") {
                 digitalWrite(relay_3, HIGH);
                 relay3_timer = millis();
