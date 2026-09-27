@@ -25,7 +25,7 @@ const char* mqtt_pass = ""; // Set your MQTT password if required
 // Firmware Update URLs
 const char* firmwareUrl = "https://github.com/shohidmax/pumpv3/releases/download/shohidpump/abbu_pump_online.ino.bin";
 const char* versionUrl = "https://raw.githubusercontent.com/shohidmax/pumpv3/refs/heads/main/version.txt";
-const char* currentFirmwareVersion = "1.0.0";
+const char* currentFirmwareVersion = "2.0.1";
 
 // Timers
 unsigned long lastUpdateCheck = 0;
@@ -34,12 +34,20 @@ unsigned long lastWifiCheck = 0;
 const unsigned long wifiCheckInterval = 10000;
 
 // --- PIN DEFINITIONS ---
-#define RELAY_1 12
-#define RELAY_2 14
-#define relay_3 13
+#define RELAY_1 25 // Changed from 12 (Safe pin, avoids boot issues)
+#define RELAY_2 26 // Changed from 14
+#define relay_3 27 // Changed from 13
 #define SWITCH_1 23
 #define SWITCH_2 22
 #define LED_PIN 2
+
+// --- RELAY POLARITY CONFIGURATION (Active-HIGH) ---
+#define RELAY_TRIGGER HIGH
+#define RELAY_RELEASE LOW
+
+// Set true if you have a physical auxiliary contact/sensor wired to SWITCH_1 (GPIO 23).
+// If false, ESP32 tracks ON/OFF state via software commands so the dashboard updates smoothly.
+#define USE_PHYSICAL_SWITCH false
 
 // --- GLOBAL VARIABLES ---
 WiFiClient espClient;
@@ -89,7 +97,12 @@ void configModeCallback(WiFiManager *myWiFiManager) {
 }
 
 void sendStatus() {
-    String reading = (digitalRead(SWITCH_1) == LOW) ? "ON" : "OFF";
+    String reading;
+    if (USE_PHYSICAL_SWITCH) {
+        reading = (digitalRead(SWITCH_1) == LOW) ? "ON" : "OFF";
+    } else {
+        reading = stableMotorState;
+    }
     String currentMode = (digitalRead(SWITCH_2) == LOW) ? "Normal" : "Emergency";
     int currentSignal = constrain(map(WiFi.RSSI(), -100, -30, 0, 100), 0, 100);
 
@@ -137,38 +150,43 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         message += (char)payload[i];
     }
     
-    Serial.printf("Message arrived on topic: %s\n", topic);
+    Serial.printf("[MQTT] Message on %s: %s\n", topic, message.c_str());
     
     if (String(topic) == topicCommand) {
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, message);
         if (!error) {
             String command = doc["command"].as<String>();
-            Serial.printf("Executing command: %s\n", command.c_str());
-            if (command == "RELAY_1" || command == "ON") {
-                digitalWrite(RELAY_1, HIGH);
+            Serial.printf("[COMMAND] Processing: %s\n", command.c_str());
+            if (command == "RELAY_1" || command == "ON" || command == "START") {
+                digitalWrite(RELAY_1, RELAY_TRIGGER);
                 relay1_timer = millis();
-                Serial.println("RELAY_1 (START) Triggered!");
-            } else if (command == "RELAY_2" || command == "OFF") {
-                digitalWrite(RELAY_2, HIGH);
+                stableMotorState = "ON";
+                Serial.println("[ACTION] RELAY_1 (START) Pulse Active -> HIGH for 1 sec");
+            } else if (command == "RELAY_2" || command == "OFF" || command == "STOP") {
+                digitalWrite(RELAY_2, RELAY_TRIGGER);
                 relay2_timer = millis();
-                Serial.println("RELAY_2 (STOP) Triggered!");
+                stableMotorState = "OFF";
+                Serial.println("[ACTION] RELAY_2 (STOP) Pulse Active -> HIGH for 1 sec");
             } else if (command == "RESET") {
-                digitalWrite(relay_3, HIGH);
+                digitalWrite(relay_3, RELAY_TRIGGER);
                 relay3_timer = millis();
+                Serial.println("[ACTION] RELAY_3 (RESET) Active -> HIGH for 1 sec");
             } else if (command == "LED_ON") {
                 digitalWrite(LED_PIN, HIGH);
-                Serial.println("Built-in LED turned ON remotely");
+                Serial.println("[ACTION] Built-in LED turned ON remotely");
             } else if (command == "LED_OFF") {
                 digitalWrite(LED_PIN, LOW);
-                Serial.println("Built-in LED turned OFF remotely");
+                Serial.println("[ACTION] Built-in LED turned OFF remotely");
             } else if (command == "RESTART_ESP") {
+                Serial.println("[ACTION] Restarting ESP32...");
                 delay(500);
                 ESP.restart();
             } else if (command == "CHECK_UPDATE") {
+                Serial.println("[ACTION] Checking for firmware updates...");
                 checkForFirmwareUpdate();
             }
-            lastStatusUpdate = 0; // Force immediate update
+            lastStatusUpdate = 0; // Force immediate status update
         }
     }
 }
@@ -194,7 +212,8 @@ void reconnectMQTT() {
             primaryFailCount = 0; // Reset fail count on success
             
             // Subscribe to Command Topic
-            mqttClient.subscribe(topicCommand.c_str());
+            bool subOk = mqttClient.subscribe(topicCommand.c_str(), 1);
+            Serial.printf("[MQTT] Subscribed to %s -> %s\n", topicCommand.c_str(), subOk ? "SUCCESS" : "FAILED");
             
             // Send Initial Status
             lastStatusUpdate = 0; 
@@ -222,9 +241,9 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     
-    pinMode(RELAY_1, OUTPUT); digitalWrite(RELAY_1, LOW);
-    pinMode(RELAY_2, OUTPUT); digitalWrite(RELAY_2, LOW);
-    pinMode(relay_3, OUTPUT); digitalWrite(relay_3, LOW);
+    pinMode(RELAY_1, OUTPUT); digitalWrite(RELAY_1, RELAY_RELEASE);
+    pinMode(RELAY_2, OUTPUT); digitalWrite(RELAY_2, RELAY_RELEASE);
+    pinMode(relay_3, OUTPUT); digitalWrite(relay_3, RELAY_RELEASE);
     pinMode(SWITCH_1, INPUT_PULLUP);
     pinMode(SWITCH_2, INPUT_PULLUP);
     pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
@@ -271,6 +290,7 @@ void setup() {
     esp_task_wdt_add(NULL);
     checkForFirmwareUpdate();
     
+    mqttClient.setBufferSize(512);
     mqttClient.setCallback(mqttCallback);
 }
 
@@ -290,16 +310,28 @@ void loop() {
         mqttClient.loop();
     }
 
-    // Handle Relay Timers
+    // Handle Relay Timers (Active-HIGH pulse ends, returns to LOW)
     unsigned long currentMillis = millis();
     if (relay1_timer > 0 && currentMillis - relay1_timer >= relay_duration) {
-        digitalWrite(RELAY_1, LOW); relay1_timer = 0;
+        digitalWrite(RELAY_1, RELAY_RELEASE); 
+        relay1_timer = 0;
+        Serial.println("[ACTION] RELAY_1 (START) Pulse Ended -> Returned to LOW");
     }
     if (relay2_timer > 0 && currentMillis - relay2_timer >= relay_duration) {
-        digitalWrite(RELAY_2, LOW); relay2_timer = 0;
+        digitalWrite(RELAY_2, RELAY_RELEASE); 
+        relay2_timer = 0;
+        Serial.println("[ACTION] RELAY_2 (STOP) Pulse Ended -> Returned to LOW");
     }
     if (relay3_timer > 0 && currentMillis - relay3_timer >= relay_duration) {
-        digitalWrite(relay_3, LOW); relay3_timer = 0;
+        digitalWrite(relay_3, RELAY_RELEASE); 
+        relay3_timer = 0;
+        Serial.println("[ACTION] RELAY_3 (RESET) Pulse Ended -> Returned to LOW");
+    }
+
+    // Periodic OTA Check every 5 minutes
+    if (millis() - lastUpdateCheck > updateCheckInterval) {
+        lastUpdateCheck = millis();
+        checkForFirmwareUpdate();
     }
 
     // Check Status and Send Update

@@ -3,7 +3,10 @@
 ## 2026-09-26 (Motor Control & MQTT Fixes)
 - **Server/.env**: Replaced failing `wss://mosquitto-muthosech.espserver.site:443` with direct TCP `mqtt://mosquitto-muthosech.espserver.site:1883`, enabling Node.js server to successfully connect and forward commands.
 - **Server/test_on.js & test_off.js**: Changed command payloads from `{ command: "ON" }` / `"OFF"` to `{ type: "command", command: "RELAY_1" }` and `"RELAY_2"`.
-- **Arduino/v3.ino**: Added dual command support so both `"RELAY_1"`/`"ON"` and `"RELAY_2"`/`"OFF"` trigger relays, plus Serial debug prints for incoming commands.
+- **Arduino/v3.ino**: Configured for Active-HIGH 2-relay pulse mode (`RELAY_TRIGGER HIGH`, `RELAY_RELEASE LOW`).
+- **Arduino/v3.ino**: Added dual command support so both `"RELAY_1"`/`"ON"`/`"START"` and `"RELAY_2"`/`"OFF"`/`"STOP"` trigger relays with 1-second pulses.
+- **Arduino/v3.ino**: Added smart dual feedback (`USE_PHYSICAL_SWITCH`) with software state fallback, ensuring instant dashboard updates even without physical sensor connected.
+- **Arduino/v3.ino**: Added periodic 5-minute OTA update check loop and set PubSubClient buffer to 512 bytes.
 
 ## 2026-09-26 (Deployment & MQTT Fixes)
 - **Infrastructure**: Fixed Coolify Mosquitto deployment issues. Switched from default buggy template to a standalone custom `Dockerfile` mapped to ports 1883 (MQTT) and 9001 (WebSockets) via Traefik.
