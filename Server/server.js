@@ -61,11 +61,17 @@ mqttClient.on('message', (topic, message) => {
         if (data.type === 'statusUpdate') {
             isEspOnline = true; // Received data means it's online
             
+            // Extract MAC from topic (e.g. device/3C8A1F9AC404/status)
+            const parts = topic.split('/');
+            const mac = parts[1];
+            data.macAddress = mac;
+            const payloadStrOut = JSON.stringify(data);
+
             // Broadcast to Web Clients
             webClients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
-                    client.send(payloadStr); // Forward raw JSON
-                    client.send(JSON.stringify({ type: 'espStatus', status: 'online' }));
+                    client.send(payloadStrOut); 
+                    client.send(JSON.stringify({ type: 'espStatus', status: 'online', macAddress: mac }));
                 }
             });
 
@@ -102,7 +108,7 @@ mqttClient.on('message', (topic, message) => {
                     console.log(`Motor Stopped. Duration: ${durationStr}`);
 
                     const newLog = new MotorLog({
-                        macAddress: DEVICE_MAC,
+                        macAddress: mac,
                         startTime: motorStartTime,
                         endTime: motorStopTime,
                         duration: durationStr,
@@ -143,10 +149,11 @@ wss.on('connection', (ws) => {
 
         if (data.type === 'command') {
             if (data.command === 'GET_LOG_PAGE') {
+                const mac = data.macAddress || DEVICE_MAC;
                 const page = data.value || 0;
                 const limit = 10;
                 
-                let query = {};
+                let query = { macAddress: mac };
                 if (data.startDate && data.endDate) {
                     const start = new Date(data.startDate);
                     start.setHours(0,0,0,0);
