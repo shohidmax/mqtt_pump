@@ -15,8 +15,42 @@ mongoose.connect(MONGODB_URI)
     .then(() => console.log('MongoDB Connected'))
     .catch(err => console.error('MongoDB connection error:', err));
 
+const DeviceSchema = new mongoose.Schema({
+    macAddress: { type: String, required: true, unique: true },
+    userId: { type: String, default: null }, // Maps to Firebase UID later
+    deviceName: { type: String, default: "Smart Pump" },
+    model: { type: String, default: "ESP32-PumpController-v1" },
+    location: {
+        address: { type: String, default: "" },
+        geo: { lat: Number, lng: Number }
+    },
+    network: {
+        connectionType: { type: String, default: "WiFi" },
+        isOnline: { type: Boolean, default: false },
+        signalStrength: { type: Number, default: 0 }
+    },
+    currentStatus: {
+        powerState: { type: String, default: "OFF" },
+        currentMode: { type: String, default: "Manual" },
+        lastTurnedOn: { type: Date, default: null },
+        lastTurnedOff: { type: Date, default: null },
+        lastAction: { type: String, default: "System Boot" },
+        lastUpdateTimestamp: { type: Date, default: Date.now }
+    },
+    createdAt: { type: Date, default: Date.now }
+});
+const Device = mongoose.model('Device', DeviceSchema);
+
 const LogSchema = new mongoose.Schema({
+    deviceId: String,
     macAddress: String,
+    eventType: { type: String, default: 'STATE_CHANGE' },
+    description: String,
+    stateDetails: {
+        powerState: String,
+        mode: String,
+        connectionType: String
+    },
     startTime: Date,
     endTime: Date,
     duration: String,
@@ -24,7 +58,7 @@ const LogSchema = new mongoose.Schema({
     bdTime: String,
     createdAt: { type: Date, default: Date.now, expires: 7776000 } // 90 Days TTL
 });
-const MotorLog = mongoose.model('MotorLog4', LogSchema);
+const DeviceLog = mongoose.model('DeviceLog', LogSchema);
 
 // --- State Tracking ---
 let motorStartTime = null;
@@ -80,13 +114,48 @@ mqttClient.on('message', (topic, message) => {
             
             if (currentMotorStatus === 'ON' && lastMotorStatus === 'OFF') {
                 motorStartTime = new Date();
-                console.log("Motor Started at:", motorStartTime);
+                console.log(`Motor Started for ${mac} at:`, motorStartTime);
+                
+                // Update Device Collection (Turned ON)
+                Device.findOneAndUpdate(
+                    { macAddress: mac },
+                    { 
+                        $set: { 
+                            "network.isOnline": true,
+                            "network.signalStrength": data.payload.wifiSignal || 0,
+                            "currentStatus.powerState": "ON",
+                            "currentStatus.currentMode": data.payload.systemMode || "Manual",
+                            "currentStatus.lastTurnedOn": motorStartTime,
+                            "currentStatus.lastAction": data.payload.lastAction || "Turned ON",
+                            "currentStatus.lastUpdateTimestamp": new Date()
+                        }
+                    },
+                    { upsert: true, new: true }
+                ).catch(err => console.error("DB Update Error:", err));
+
             } else if (currentMotorStatus === 'OFF' && lastMotorStatus === 'ON' && motorStartTime) {
                 const motorStopTime = new Date();
                 const durationMs = motorStopTime - motorStartTime;
                 const durationSec = Math.floor(durationMs / 1000);
                 
                 const durationStr = `${Math.floor(durationSec / 60)}m ${durationSec % 60}s`;
+
+                // Update Device Collection (Turned OFF)
+                Device.findOneAndUpdate(
+                    { macAddress: mac },
+                    { 
+                        $set: { 
+                            "network.isOnline": true,
+                            "network.signalStrength": data.payload.wifiSignal || 0,
+                            "currentStatus.powerState": "OFF",
+                            "currentStatus.currentMode": data.payload.systemMode || "Manual",
+                            "currentStatus.lastTurnedOff": motorStopTime,
+                            "currentStatus.lastAction": data.payload.lastAction || "Turned OFF",
+                            "currentStatus.lastUpdateTimestamp": new Date()
+                        }
+                    },
+                    { upsert: true, new: true }
+                ).catch(err => console.error("DB Update Error:", err));
 
                 if (durationSec >= 2) {
                     const optionsDate = { timeZone: 'Asia/Dhaka', day: '2-digit', month: '2-digit', year: 'numeric' };
@@ -105,19 +174,42 @@ mqttClient.on('message', (topic, message) => {
                     
                     const bdTimeFinal = motorStopTime.toLocaleTimeString('en-US', optionsTime);
 
-                    console.log(`Motor Stopped. Duration: ${durationStr}`);
+                    console.log(`Motor Stopped for ${mac}. Duration: ${durationStr}`);
 
-                    const newLog = new MotorLog({
+                    const newLog = new DeviceLog({
                         macAddress: mac,
+                        eventType: 'STATE_CHANGE',
+                        description: data.payload.lastAction || "Turned OFF",
+                        stateDetails: {
+                            powerState: "OFF",
+                            mode: data.payload.systemMode || "Manual",
+                            connectionType: "WiFi"
+                        },
                         startTime: motorStartTime,
                         endTime: motorStopTime,
                         duration: durationStr,
                         bdDate: bdDateFinal,
                         bdTime: bdTimeFinal
                     });
-                    newLog.save().then(() => console.log("Log saved to DB")).catch(err => console.error(err));
+                    newLog.save().then(() => console.log("DeviceLog saved to DB")).catch(err => console.error(err));
                 }
                 motorStartTime = null; 
+            } else {
+                // Just a heartbeat update (Device is Online but state didn't change ON/OFF boundary)
+                Device.findOneAndUpdate(
+                    { macAddress: mac },
+                    { 
+                        $set: { 
+                            "network.isOnline": true,
+                            "network.signalStrength": data.payload.wifiSignal || 0,
+                            "currentStatus.powerState": currentMotorStatus,
+                            "currentStatus.currentMode": data.payload.systemMode || "Manual",
+                            "currentStatus.lastAction": data.payload.lastAction || "Heartbeat",
+                            "currentStatus.lastUpdateTimestamp": new Date()
+                        }
+                    },
+                    { upsert: true }
+                ).catch(err => console.error("DB Update Error:", err));
             }
             lastMotorStatus = currentMotorStatus;
         }
@@ -166,9 +258,9 @@ wss.on('connection', (ws) => {
                 }
 
                 try {
-                    const totalLogs = await MotorLog.countDocuments(query);
+                    const totalLogs = await DeviceLog.countDocuments(query);
                     const totalPages = Math.ceil(totalLogs / limit);
-                    const logs = await MotorLog.find(query)
+                    const logs = await DeviceLog.find(query)
                         .sort({ createdAt: -1 })
                         .skip(page * limit)
                         .limit(limit);
@@ -201,9 +293,10 @@ wss.on('connection', (ws) => {
                     console.error("Error fetching logs:", err);
                 }
             } else if (data.command === 'CLEAR_LOGS') {
+                const mac = data.macAddress || DEVICE_MAC;
                 try {
-                    await MotorLog.deleteMany({});
-                    console.log("All logs cleared.");
+                    await DeviceLog.deleteMany({ macAddress: mac });
+                    console.log(`All logs cleared for ${mac}.`);
                     webClients.forEach(client => {
                         if (client.readyState === WebSocket.OPEN) {
                              client.send(JSON.stringify({
@@ -222,7 +315,8 @@ wss.on('connection', (ws) => {
             } else {
                  // Forward Hardware Commands to ESP32 via MQTT
                  if (mqttClient.connected) {
-                     const commandTopic = `device/${DEVICE_MAC}/command`;
+                     const mac = data.macAddress || DEVICE_MAC;
+                     const commandTopic = `device/${mac}/command`;
                      mqttClient.publish(commandTopic, message.toString(), { qos: 1 });
                      console.log(`Forwarded command to MQTT: ${commandTopic} -> ${message.toString()}`);
                  } else {
