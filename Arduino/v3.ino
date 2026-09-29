@@ -4,6 +4,7 @@
 
 // Define this before including TinyGsmClient.h
 #define TINY_GSM_MODEM_SIM800
+#define TINY_GSM_DEBUG Serial
 
 #include <TinyGsmClient.h>
 #include <WiFi.h>
@@ -20,7 +21,7 @@
 
 // --- Configuration ---
 const char* mqtt_broker_1 = "mosquitto-muthosech.espserver.site";
-const char* mqtt_broker_2 = "mosquitto-muthosech.espserver.site"; // Secondary broker for failover
+const char* mqtt_broker_2 = "mosq.maxapi.esp32.site"; // Secondary broker for failover
 const uint16_t mqtt_port = 1883; 
 const char* mqtt_user = ""; 
 const char* mqtt_pass = ""; 
@@ -30,7 +31,7 @@ const char apn[]      = "gpinternet";
 const char gprsUser[] = "";
 const char gprsPass[] = "";
 
-#define WDT_TIMEOUT 30
+#define WDT_TIMEOUT 120
 
 // Firmware Update URLs
 const char* firmwareUrl = "https://github.com/shohidmax/pumpv3/releases/download/shohidpump/abbu_pump_online.ino.bin";
@@ -75,6 +76,7 @@ public:
   bool dtmf2 = false;
   bool dtmf0 = false;
   bool ring = false;
+  bool noCarrier = false;
   
   SpyStream(HardwareSerial* t) : target(t) { buffer.reserve(64); }
   
@@ -90,6 +92,7 @@ public:
         else if (buffer.indexOf("+DTMF: 2") != -1) dtmf2 = true;
         else if (buffer.indexOf("+DTMF: 0") != -1) dtmf0 = true;
         else if (buffer.indexOf("RING") != -1) ring = true;
+        else if (buffer.indexOf("NO CARRIER") != -1) noCarrier = true;
         buffer = "";
       }
       if (buffer.length() > 60) buffer = ""; // Prevent memory overflow
@@ -118,6 +121,9 @@ String topicCommand;
 int primaryFailCount = 0;
 bool useSecondaryBroker = false;
 bool isUsingGPRS = false; 
+bool gprsConnected = false; // Tracks actual PDP context status
+bool inCall = false;
+unsigned long callStartTime = 0;
 
 unsigned long relay1_timer = 0;
 unsigned long relay2_timer = 0;
@@ -285,6 +291,7 @@ void reconnectMQTT() {
         Serial.print(" via ");
         Serial.print(isUsingGPRS ? "GPRS (SIM)" : "WiFi");
         Serial.print("...");
+        esp_task_wdt_reset(); // Reset WDT before potentially blocking connection
         
         if (mqttClient.connect(macAddress.c_str(), mqtt_user, mqtt_pass)) {
             Serial.println("connected");
@@ -410,6 +417,8 @@ void loop() {
     // --- PHONE CALL & DTMF (IVR) LOGIC ---
     if (spySerial.ring) {
         spySerial.ring = false;
+        inCall = true;
+        callStartTime = millis();
         Serial.println("Incoming Call! Answering...");
         modem.callAnswer();
         
@@ -439,8 +448,21 @@ void loop() {
     
     if (spySerial.dtmf0) {
         spySerial.dtmf0 = false;
+        inCall = false;
         Serial.println("DTMF 0 Received (Via Phone): HANGING UP");
         modem.callHangup();
+    }
+
+    if (spySerial.noCarrier) {
+        spySerial.noCarrier = false;
+        inCall = false;
+        Serial.println("Call Ended (NO CARRIER)");
+    }
+
+    // Failsafe to release inCall flag after 60 seconds
+    if (inCall && (millis() - callStartTime > 60000)) {
+        inCall = false;
+        Serial.println("Call Timeout. Releasing call state.");
     }
     
     // --- NETWORK MANAGEMENT (Dual Failover) ---
@@ -460,23 +482,29 @@ void loop() {
         if (!isUsingGPRS) {
             Serial.println("WiFi Lost. Switching to SIM800L GPRS...");
             isUsingGPRS = true;
+            gprsConnected = false; // Reset to force GPRS initialization
             mqttClient.disconnect();
             mqttClient.setClient(gsmClient);
         }
 
-        if (isUsingGPRS && !modem.isGprsConnected()) {
+        if (isUsingGPRS && (!gprsConnected || !modem.isGprsConnected())) {
             if (millis() - lastGprsConnectAttempt > 10000) { 
                 lastGprsConnectAttempt = millis();
                 Serial.println("Initializing SIM800L and connecting to GPRS...");
                 
                 // Only restart modem if we are not in a voice call
-                if (modem.getCallStatus() == 0) {
+                if (!inCall) {
                     if (modem.restart()) {
+                        esp_task_wdt_reset(); // Reset WDT after restart
                         if (modem.waitForNetwork(60000)) {
+                            esp_task_wdt_reset(); // Reset WDT after network wait
                             if (modem.gprsConnect(apn, gprsUser, gprsPass)) {
-                                Serial.println("GPRS Connected Successfully!");
+                                Serial.println("GPRS Connected Successfully! Waiting 3s...");
+                                delay(3000); // Give modem time before TCP attempt
+                                gprsConnected = true;
                             } else {
                                 Serial.println("GPRS Connect Failed!");
+                                gprsConnected = false;
                             }
                         }
                     }
@@ -486,7 +514,7 @@ void loop() {
     }
 
     // --- HANDLE MQTT ---
-    if ((!isUsingGPRS && WiFi.status() == WL_CONNECTED) || (isUsingGPRS && modem.isGprsConnected())) {
+    if ((!isUsingGPRS && WiFi.status() == WL_CONNECTED) || (isUsingGPRS && gprsConnected)) {
         if (!mqttClient.connected()) {
             reconnectMQTT();
         } else {
