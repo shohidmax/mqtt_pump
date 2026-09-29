@@ -5,8 +5,10 @@ const express = require('express');
 const path = require('path');
 const mongoose = require('mongoose');
 const mqtt = require('mqtt');
+const cors = require('cors');
 
 const app = express();
+app.use(cors());
 const server = http.createServer(app);
 
 // --- MongoDB Setup ---
@@ -330,6 +332,76 @@ wss.on('connection', (ws) => {
         webClients.delete(ws);
         console.log('Web Dashboard client disconnected.');
     });
+});
+
+// --- HTTP API for Devices ---
+app.use(express.json());
+
+app.get('/api/devices', async (req, res) => {
+    try {
+        const userId = req.query.userId;
+        const query = userId ? { userId } : {};
+        const devices = await Device.find(query).sort({ createdAt: -1 });
+        // Map to expected frontend format
+        const formatted = devices.map(d => ({
+            id: d._id,
+            name: d.deviceName,
+            macAddress: d.macAddress,
+            network: d.network,
+            currentStatus: d.currentStatus
+        }));
+        res.json(formatted);
+    } catch (err) {
+        res.status(500).json({ error: "Failed to fetch devices" });
+    }
+});
+
+app.post('/api/devices', async (req, res) => {
+    try {
+        const { userId, name, macAddress } = req.body;
+        if (!macAddress) return res.status(400).json({ error: "MAC Address is required" });
+        
+        // Add new device or update existing if it exists
+        const device = await Device.findOneAndUpdate(
+            { macAddress: macAddress.toUpperCase() },
+            { 
+                $set: { 
+                    userId: userId, 
+                    deviceName: name, 
+                    "network.connectionType": "WiFi"
+                } 
+            },
+            { upsert: true, new: true }
+        );
+        res.json({ id: device._id, name: device.deviceName, macAddress: device.macAddress });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to add device" });
+    }
+});
+
+app.put('/api/devices/:id', async (req, res) => {
+    try {
+        const { name, macAddress } = req.body;
+        const device = await Device.findByIdAndUpdate(req.params.id, 
+            { $set: { deviceName: name, macAddress: macAddress.toUpperCase() } },
+            { new: true }
+        );
+        res.json({ id: device._id, name: device.deviceName, macAddress: device.macAddress });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to update device" });
+    }
+});
+
+app.delete('/api/devices/:id', async (req, res) => {
+    try {
+        const device = await Device.findByIdAndDelete(req.params.id);
+        if (device) {
+             await DeviceLog.deleteMany({ macAddress: device.macAddress });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to delete device" });
+    }
 });
 
 // --- HTTP Static ---
