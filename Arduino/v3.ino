@@ -1,7 +1,11 @@
 // =================================================================
-// ESP32 MQTT Client - HA Architecture with Dual Broker Failover
+// ESP32 MQTT Client - WiFi + SIM800L GPRS Auto Failover + IVR Voice Call
 // =================================================================
 
+// Define this before including TinyGsmClient.h
+#define TINY_GSM_MODEM_SIM800
+
+#include <TinyGsmClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
@@ -12,20 +16,26 @@
 #include <esp_task_wdt.h>
 #include <nvs_flash.h>
 #include <Ticker.h>
+#include <DFRobotDFPlayerMini.h>
 
 // --- Configuration ---
 const char* mqtt_broker_1 = "mosquitto-muthosech.espserver.site";
 const char* mqtt_broker_2 = "mosquitto-muthosech.espserver.site"; // Secondary broker for failover
-const uint16_t mqtt_port = 1883; // Use 8883 for TLS in production
-const char* mqtt_user = ""; // Set your MQTT username if required
-const char* mqtt_pass = ""; // Set your MQTT password if required
+const uint16_t mqtt_port = 1883; 
+const char* mqtt_user = ""; 
+const char* mqtt_pass = ""; 
+
+// --- GPRS (SIM Internet) Configuration ---
+const char apn[]      = "gpinternet"; 
+const char gprsUser[] = "";
+const char gprsPass[] = "";
 
 #define WDT_TIMEOUT 30
 
 // Firmware Update URLs
 const char* firmwareUrl = "https://github.com/shohidmax/pumpv3/releases/download/shohidpump/abbu_pump_online.ino.bin";
 const char* versionUrl = "https://raw.githubusercontent.com/shohidmax/pumpv3/refs/heads/main/version.txt";
-const char* currentFirmwareVersion = "2.0.1";
+const char* currentFirmwareVersion = "2.3.0"; // Bump version for IVR Integration
 
 // Timers
 unsigned long lastUpdateCheck = 0;
@@ -34,24 +44,72 @@ unsigned long lastWifiCheck = 0;
 const unsigned long wifiCheckInterval = 10000;
 
 // --- PIN DEFINITIONS ---
-#define RELAY_1 25 // Changed from 12 (Safe pin, avoids boot issues)
-#define RELAY_2 26 // Changed from 14
-#define relay_3 27 // Changed from 13
+#define RELAY_1 25
+#define RELAY_2 26
+#define relay_3 32 
 #define SWITCH_1 23
 #define SWITCH_2 22
 #define LED_PIN 2
+
+// --- SIM800L & DFPLAYER PINS ---
+#define ESP_RX_FROM_SIM800 16 
+#define ESP_TX_TO_SIM800 17   
+#define SIM800_RST 33
+#define ESP_RX_FROM_DFPLAYER 14 
+#define ESP_TX_TO_DFPLAYER 27   
 
 // --- RELAY POLARITY CONFIGURATION (Active-HIGH) ---
 #define RELAY_TRIGGER HIGH
 #define RELAY_RELEASE LOW
 
-// Set true if you have a physical auxiliary contact/sensor wired to SWITCH_1 (GPIO 23).
-// If false, ESP32 tracks ON/OFF state via software commands so the dashboard updates smoothly.
 #define USE_PHYSICAL_SWITCH false
+
+// --- SPY STREAM FOR DTMF INTERCEPTION ---
+// This safely reads the SIM800L serial data to catch incoming calls and DTMF 
+// without stealing the internet data from TinyGSM.
+class SpyStream : public Stream {
+public:
+  HardwareSerial* target;
+  String buffer;
+  bool dtmf1 = false;
+  bool dtmf2 = false;
+  bool dtmf0 = false;
+  bool ring = false;
+  
+  SpyStream(HardwareSerial* t) : target(t) { buffer.reserve(64); }
+  
+  int available() override { return target->available(); }
+  
+  int read() override { 
+    int c = target->read(); 
+    if (c >= 0) {
+      char ch = (char)c;
+      buffer += ch;
+      if (ch == '\n') {
+        if (buffer.indexOf("+DTMF: 1") != -1) dtmf1 = true;
+        else if (buffer.indexOf("+DTMF: 2") != -1) dtmf2 = true;
+        else if (buffer.indexOf("+DTMF: 0") != -1) dtmf0 = true;
+        else if (buffer.indexOf("RING") != -1) ring = true;
+        buffer = "";
+      }
+      if (buffer.length() > 60) buffer = ""; // Prevent memory overflow
+    }
+    return c;
+  }
+  
+  int peek() override { return target->peek(); }
+  void flush() override { target->flush(); }
+  size_t write(uint8_t c) override { return target->write(c); }
+  size_t write(const uint8_t *buf, size_t size) override { return target->write(buf, size); }
+};
 
 // --- GLOBAL VARIABLES ---
 WiFiClient espClient;
-PubSubClient mqttClient(espClient);
+SpyStream spySerial(&Serial1);
+TinyGsm modem(spySerial);
+TinyGsmClient gsmClient(modem);
+PubSubClient mqttClient;
+DFRobotDFPlayerMini myDFPlayer;
 
 String macAddress;
 String topicStatus;
@@ -59,11 +117,12 @@ String topicCommand;
 
 int primaryFailCount = 0;
 bool useSecondaryBroker = false;
+bool isUsingGPRS = false; 
 
 unsigned long relay1_timer = 0;
 unsigned long relay2_timer = 0;
 unsigned long relay3_timer = 0;
-const int relay_duration = 1000; // 1 Second Pulse
+const int relay_duration = 1000; 
 
 unsigned long lastStatusUpdate = 0;
 String lastMotorStat = "";
@@ -82,6 +141,7 @@ String fetchLatestVersion();
 void downloadAndApplyFirmware();
 bool startOTAUpdate(WiFiClient* client, int contentLength);
 void reconnectMQTT();
+void sendStatus();
 
 // --- FUNCTIONS ---
 
@@ -104,7 +164,14 @@ void sendStatus() {
         reading = stableMotorState;
     }
     String currentMode = (digitalRead(SWITCH_2) == LOW) ? "Normal" : "Emergency";
-    int currentSignal = constrain(map(WiFi.RSSI(), -100, -30, 0, 100), 0, 100);
+    
+    int currentSignal = 0;
+    if (isUsingGPRS) {
+        int csq = modem.getSignalQuality(); 
+        currentSignal = constrain(map(csq, 0, 31, 0, 100), 0, 100);
+    } else {
+        currentSignal = constrain(map(WiFi.RSSI(), -100, -30, 0, 100), 0, 100);
+    }
 
     if (reading != stableMotorState) {
        if ((millis() - lastDebounceTime) > debounceDelay) {
@@ -126,14 +193,15 @@ void sendStatus() {
         payload["motorStatus"] = currentMotor;
         payload["systemMode"] = currentMode;
         payload["wifiSignal"] = currentSignal;
-        payload["localIP"] = WiFi.localIP().toString();
+        payload["localIP"] = isUsingGPRS ? modem.getLocalIP() : WiFi.localIP().toString();
         payload["version"] = currentFirmwareVersion;
+        payload["network"] = isUsingGPRS ? "SIM800L (GPRS)" : "WiFi";
         
         String jsonString;
         serializeJson(doc, jsonString);
         
         if (mqttClient.connected()) {
-            mqttClient.publish(topicStatus.c_str(), jsonString.c_str(), true); // Retained message
+            mqttClient.publish(topicStatus.c_str(), jsonString.c_str(), true); 
         }
 
         lastMotorStat = currentMotor;
@@ -141,6 +209,42 @@ void sendStatus() {
         lastWifiSignal = currentSignal;
         lastStatusUpdate = millis();
     }
+}
+
+void processCommand(String command) {
+    if (command == "RELAY_1" || command == "ON" || command == "START") {
+        digitalWrite(RELAY_1, RELAY_TRIGGER);
+        relay1_timer = millis();
+        stableMotorState = "ON";
+        Serial.println("[ACTION] RELAY_1 (START) Pulse Active -> HIGH for 1 sec");
+    } else if (command == "RELAY_2" || command == "OFF" || command == "STOP") {
+        digitalWrite(RELAY_2, RELAY_TRIGGER);
+        relay2_timer = millis();
+        stableMotorState = "OFF";
+        Serial.println("[ACTION] RELAY_2 (STOP) Pulse Active -> HIGH for 1 sec");
+    } else if (command == "RESET") {
+        digitalWrite(relay_3, RELAY_TRIGGER);
+        relay3_timer = millis();
+        Serial.println("[ACTION] RELAY_3 (RESET) Active -> HIGH for 1 sec");
+    } else if (command == "LED_ON") {
+        digitalWrite(LED_PIN, HIGH);
+        Serial.println("[ACTION] Built-in LED turned ON remotely");
+    } else if (command == "LED_OFF") {
+        digitalWrite(LED_PIN, LOW);
+        Serial.println("[ACTION] Built-in LED turned OFF remotely");
+    } else if (command == "RESTART_ESP") {
+        Serial.println("[ACTION] Restarting ESP32...");
+        delay(500);
+        ESP.restart();
+    } else if (command == "CHECK_UPDATE") {
+        Serial.println("[ACTION] Checking for firmware updates...");
+        if (isUsingGPRS) {
+            Serial.println("[WARN] OTA Updates are disabled over GPRS to prevent failure. Connect to WiFi first.");
+        } else {
+            checkForFirmwareUpdate();
+        }
+    }
+    lastStatusUpdate = 0; 
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -158,45 +262,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (!error) {
             String command = doc["command"].as<String>();
             Serial.printf("[COMMAND] Processing: %s\n", command.c_str());
-            if (command == "RELAY_1" || command == "ON" || command == "START") {
-                digitalWrite(RELAY_1, RELAY_TRIGGER);
-                relay1_timer = millis();
-                stableMotorState = "ON";
-                Serial.println("[ACTION] RELAY_1 (START) Pulse Active -> HIGH for 1 sec");
-            } else if (command == "RELAY_2" || command == "OFF" || command == "STOP") {
-                digitalWrite(RELAY_2, RELAY_TRIGGER);
-                relay2_timer = millis();
-                stableMotorState = "OFF";
-                Serial.println("[ACTION] RELAY_2 (STOP) Pulse Active -> HIGH for 1 sec");
-            } else if (command == "RESET") {
-                digitalWrite(relay_3, RELAY_TRIGGER);
-                relay3_timer = millis();
-                Serial.println("[ACTION] RELAY_3 (RESET) Active -> HIGH for 1 sec");
-            } else if (command == "LED_ON") {
-                digitalWrite(LED_PIN, HIGH);
-                Serial.println("[ACTION] Built-in LED turned ON remotely");
-            } else if (command == "LED_OFF") {
-                digitalWrite(LED_PIN, LOW);
-                Serial.println("[ACTION] Built-in LED turned OFF remotely");
-            } else if (command == "RESTART_ESP") {
-                Serial.println("[ACTION] Restarting ESP32...");
-                delay(500);
-                ESP.restart();
-            } else if (command == "CHECK_UPDATE") {
-                Serial.println("[ACTION] Checking for firmware updates...");
-                checkForFirmwareUpdate();
-            }
-            lastStatusUpdate = 0; // Force immediate status update
+            processCommand(command);
         }
     }
 }
 
 unsigned long lastReconnectAttempt = 0;
+unsigned long lastGprsConnectAttempt = 0;
 
 void reconnectMQTT() {
     if (!mqttClient.connected()) {
         if (lastReconnectAttempt > 0 && millis() - lastReconnectAttempt < 5000) {
-            return; // Wait 5 seconds before retrying
+            return; 
         }
         lastReconnectAttempt = millis();
 
@@ -205,17 +282,17 @@ void reconnectMQTT() {
         
         Serial.print("Attempting MQTT connection to ");
         Serial.print(broker);
+        Serial.print(" via ");
+        Serial.print(isUsingGPRS ? "GPRS (SIM)" : "WiFi");
         Serial.print("...");
         
         if (mqttClient.connect(macAddress.c_str(), mqtt_user, mqtt_pass)) {
             Serial.println("connected");
-            primaryFailCount = 0; // Reset fail count on success
+            primaryFailCount = 0; 
             
-            // Subscribe to Command Topic
             bool subOk = mqttClient.subscribe(topicCommand.c_str(), 1);
             Serial.printf("[MQTT] Subscribed to %s -> %s\n", topicCommand.c_str(), subOk ? "SUCCESS" : "FAILED");
             
-            // Send Initial Status
             lastStatusUpdate = 0; 
             sendStatus();
         } else {
@@ -230,7 +307,6 @@ void reconnectMQTT() {
                     useSecondaryBroker = true;
                 }
             } else {
-                // If secondary fails, maybe fallback to primary after a while, or restart
                 Serial.println("Secondary broker failed. Rebooting network stack soon.");
             }
         }
@@ -247,6 +323,21 @@ void setup() {
     pinMode(SWITCH_1, INPUT_PULLUP);
     pinMode(SWITCH_2, INPUT_PULLUP);
     pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
+
+    // Initialize SIM800L on Serial1
+    pinMode(SIM800_RST, OUTPUT);
+    digitalWrite(SIM800_RST, HIGH);
+    Serial1.begin(9600, SERIAL_8N1, ESP_RX_FROM_SIM800, ESP_TX_TO_SIM800);
+    Serial.println("SIM800L Serial1 Initialized");
+
+    // Initialize DFPlayer on Serial2
+    Serial2.begin(9600, SERIAL_8N1, ESP_RX_FROM_DFPLAYER, ESP_TX_TO_DFPLAYER);
+    if (!myDFPlayer.begin(Serial2)) {
+        Serial.println(F("Unable to begin DFPlayer. Check connection/SD card."));
+    } else {
+        Serial.println(F("DFPlayer Mini Initialized."));
+        myDFPlayer.volume(25); // Volume (0~30)
+    }
 
     esp_task_wdt_deinit();
     esp_task_wdt_config_t wdt_config = {
@@ -268,70 +359,165 @@ void setup() {
     
     WiFiManager wm;
     wm.setAPCallback(configModeCallback);
-    wm.setConfigPortalTimeout(180);
+    wm.setConfigPortalTimeout(60); 
 
+    Serial.println("Attempting WiFi Connection...");
     if (!wm.autoConnect("Mutho-Sech")) {
-        Serial.println("Failed to connect. Restarting...");
-        delay(3000);
-        ESP.restart();
+        Serial.println("WiFi Failed to connect. Will fallback to SIM800L GPRS!");
+    } else {
+        Serial.println("WiFi Connected!");
     }
 
     blinker.detach();
     digitalWrite(LED_PIN, HIGH);
 
     macAddress = WiFi.macAddress();
-    macAddress.replace(":", "");
+    if(macAddress == "" || macAddress == "00:00:00:00:00:00") {
+        uint64_t chipid = ESP.getEfuseMac(); 
+        char macStr[13];
+        snprintf(macStr, 13, "%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
+        macAddress = String(macStr);
+    } else {
+        macAddress.replace(":", "");
+    }
+
     topicStatus = "device/" + macAddress + "/status";
     topicCommand = "device/" + macAddress + "/command";
     
-    Serial.println("WiFi Connected!");
     Serial.println("MAC: " + macAddress);
     
     esp_task_wdt_add(NULL);
-    checkForFirmwareUpdate();
     
     mqttClient.setBufferSize(512);
+    mqttClient.setKeepAlive(10);
+    mqttClient.setSocketTimeout(15);
     mqttClient.setCallback(mqttCallback);
+
+    // Initial Network Selection
+    if (WiFi.status() == WL_CONNECTED) {
+        mqttClient.setClient(espClient);
+        isUsingGPRS = false;
+        checkForFirmwareUpdate();
+    } else {
+        mqttClient.setClient(gsmClient);
+        isUsingGPRS = true;
+    }
 }
 
 void loop() {
     esp_task_wdt_reset();
     
-    if (WiFi.status() != WL_CONNECTED) {
-        if (millis() - lastWifiCheck > wifiCheckInterval) {
-            lastWifiCheck = millis();
-            Serial.println("WiFi Lost! Attempting reconnect...");
-            WiFi.reconnect();
+    // --- PHONE CALL & DTMF (IVR) LOGIC ---
+    if (spySerial.ring) {
+        spySerial.ring = false;
+        Serial.println("Incoming Call! Answering...");
+        modem.callAnswer();
+        
+        // Wait for call to connect, then enable DTMF detection
+        delay(1000);
+        modem.sendAT("+DDET=1");
+        modem.waitResponse();
+
+        // Play welcome audio (Ensure 0001.mp3 is on SD card)
+        myDFPlayer.play(1); 
+        Serial.println("Played Welcome Audio");
+    }
+    
+    if (spySerial.dtmf1) {
+        spySerial.dtmf1 = false;
+        Serial.println("DTMF 1 Received (Via Phone): START MOTOR");
+        processCommand("START");
+        myDFPlayer.play(2); // Play "Motor Started" audio (0002.mp3)
+    }
+    
+    if (spySerial.dtmf2) {
+        spySerial.dtmf2 = false;
+        Serial.println("DTMF 2 Received (Via Phone): STOP MOTOR");
+        processCommand("STOP");
+        myDFPlayer.play(3); // Play "Motor Stopped" audio (0003.mp3)
+    }
+    
+    if (spySerial.dtmf0) {
+        spySerial.dtmf0 = false;
+        Serial.println("DTMF 0 Received (Via Phone): HANGING UP");
+        modem.callHangup();
+    }
+    
+    // --- NETWORK MANAGEMENT (Dual Failover) ---
+    if (WiFi.status() == WL_CONNECTED) {
+        if (isUsingGPRS) {
+            Serial.println("WiFi Restored. Switching from GPRS back to WiFi...");
+            isUsingGPRS = false;
+            mqttClient.disconnect();
+            mqttClient.setClient(espClient);
         }
     } else {
-        if (!mqttClient.connected()) {
-            reconnectMQTT();
+        if (millis() - lastWifiCheck > wifiCheckInterval) {
+            lastWifiCheck = millis();
+            WiFi.reconnect();
         }
-        mqttClient.loop();
+        
+        if (!isUsingGPRS) {
+            Serial.println("WiFi Lost. Switching to SIM800L GPRS...");
+            isUsingGPRS = true;
+            mqttClient.disconnect();
+            mqttClient.setClient(gsmClient);
+        }
+
+        if (isUsingGPRS && !modem.isGprsConnected()) {
+            if (millis() - lastGprsConnectAttempt > 10000) { 
+                lastGprsConnectAttempt = millis();
+                Serial.println("Initializing SIM800L and connecting to GPRS...");
+                
+                // Only restart modem if we are not in a voice call
+                if (modem.getCallStatus() == 0) {
+                    if (modem.restart()) {
+                        if (modem.waitForNetwork(60000)) {
+                            if (modem.gprsConnect(apn, gprsUser, gprsPass)) {
+                                Serial.println("GPRS Connected Successfully!");
+                            } else {
+                                Serial.println("GPRS Connect Failed!");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    // Handle Relay Timers (Active-HIGH pulse ends, returns to LOW)
+    // --- HANDLE MQTT ---
+    if ((!isUsingGPRS && WiFi.status() == WL_CONNECTED) || (isUsingGPRS && modem.isGprsConnected())) {
+        if (!mqttClient.connected()) {
+            reconnectMQTT();
+        } else {
+            mqttClient.loop();
+        }
+    }
+
+    // --- HANDLE RELAY TIMERS ---
     unsigned long currentMillis = millis();
     if (relay1_timer > 0 && currentMillis - relay1_timer >= relay_duration) {
         digitalWrite(RELAY_1, RELAY_RELEASE); 
         relay1_timer = 0;
-        Serial.println("[ACTION] RELAY_1 (START) Pulse Ended -> Returned to LOW");
+        Serial.println("[ACTION] RELAY_1 (START) Pulse Ended");
     }
     if (relay2_timer > 0 && currentMillis - relay2_timer >= relay_duration) {
         digitalWrite(RELAY_2, RELAY_RELEASE); 
         relay2_timer = 0;
-        Serial.println("[ACTION] RELAY_2 (STOP) Pulse Ended -> Returned to LOW");
+        Serial.println("[ACTION] RELAY_2 (STOP) Pulse Ended");
     }
     if (relay3_timer > 0 && currentMillis - relay3_timer >= relay_duration) {
         digitalWrite(relay_3, RELAY_RELEASE); 
         relay3_timer = 0;
-        Serial.println("[ACTION] RELAY_3 (RESET) Pulse Ended -> Returned to LOW");
+        Serial.println("[ACTION] RELAY_3 (RESET) Pulse Ended");
     }
 
-    // Periodic OTA Check every 5 minutes
+    // --- OTA CHECK (WiFi ONLY) ---
     if (millis() - lastUpdateCheck > updateCheckInterval) {
         lastUpdateCheck = millis();
-        checkForFirmwareUpdate();
+        if (!isUsingGPRS) {
+            checkForFirmwareUpdate();
+        }
     }
 
     // Check Status and Send Update
