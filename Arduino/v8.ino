@@ -21,7 +21,7 @@
 
 // --- Configuration ---
 const char* mqtt_broker_1 = "mosquitto-muthosech.espserver.site";
-const char* mqtt_broker_2 = "mosq.maxapi.esp32.site"; // Secondary broker for failover
+const char* mqtt_broker_2 = "mosquitto-muthosech.espserver.site"; // Secondary broker for failover
 const uint16_t mqtt_port = 1883; 
 const char* mqtt_user = ""; 
 const char* mqtt_pass = ""; 
@@ -312,9 +312,16 @@ void reconnectMQTT() {
                 if (primaryFailCount >= 3) {
                     Serial.println("Primary broker failed 3 times. Switching to Secondary Broker!");
                     useSecondaryBroker = true;
+                    primaryFailCount = 0; // Reset counter for secondary
                 }
             } else {
-                Serial.println("Secondary broker failed. Rebooting network stack soon.");
+                primaryFailCount++;
+                Serial.println("Secondary broker failed.");
+                if (primaryFailCount >= 3) {
+                    Serial.println("Secondary broker failed 3 times. Switching back to Primary Broker!");
+                    useSecondaryBroker = false;
+                    primaryFailCount = 0;
+                }
             }
         }
     }
