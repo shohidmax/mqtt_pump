@@ -340,7 +340,9 @@ app.use(express.json());
 app.get('/api/devices', async (req, res) => {
     try {
         const userId = req.query.userId;
-        const query = userId ? { userId } : {};
+        const query = userId 
+            ? { $or: [{ userId }, { userId: null }, { userId: { $exists: false } }] } 
+            : {};
         const devices = await Device.find(query).sort({ createdAt: -1 });
         // Map to expected frontend format
         const formatted = devices.map(d => ({

@@ -1,12 +1,8 @@
 // =================================================================
-// ESP32 MQTT Client - WiFi + SIM800L GPRS Auto Failover + IVR Voice Call
+// ESP32 MQTT Client - Pure WiFi Internet + SIM800L Voice Call & IVR DTMF
+// (No GPRS / No SIM Internet: SIM800L is 100% Dedicated to Calls & DTMF)
 // =================================================================
 
-// Define this before including TinyGsmClient.h
-#define TINY_GSM_MODEM_SIM800
-#define TINY_GSM_DEBUG Serial
-
-#include <TinyGsmClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
@@ -19,24 +15,28 @@
 #include <Ticker.h>
 #include <DFRobotDFPlayerMini.h>
 
-// --- Configuration ---
-const char* mqtt_broker_1 = "mosquitto-muthosech.espserver.site";
-const char* mqtt_broker_2 = "mosquitto-muthosech.espserver.site"; // Secondary broker for failover
+// --- Configuration: Primary & True Secondary MQTT Brokers (WiFi Only) ---
+const char* mqtt_broker_1 = "mosquitto-muthosech.espserver.site"; // Primary Broker
+const char* mqtt_broker_2 = "broker.emqx.io";                     // Independent Secondary Broker
 const uint16_t mqtt_port = 1883; 
 const char* mqtt_user = ""; 
 const char* mqtt_pass = ""; 
 
-// --- GPRS (SIM Internet) Configuration ---
-const char apn[]      = "gpinternet"; 
-const char gprsUser[] = "";
-const char gprsPass[] = "";
-
 #define WDT_TIMEOUT 120
 
-// Firmware Update URLs
+// Firmware Update URLs (via WiFi)
 const char* firmwareUrl = "https://github.com/shohidmax/pumpv3/releases/download/shohidpump/abbu_pump_online.ino.bin";
 const char* versionUrl = "https://raw.githubusercontent.com/shohidmax/pumpv3/refs/heads/main/version.txt";
-const char* currentFirmwareVersion = "2.3.0"; // Bump version for IVR Integration
+const char* currentFirmwareVersion = "2.4.0"; 
+
+// --- SECURITY & CALLER ID WHITELIST ---
+// Set enableCallerIdWhitelist to true in production to restrict motor call control
+bool enableCallerIdWhitelist = false; 
+const char* authorizedNumbers[] = {
+    "+8801793496030", // Master phone number
+    "+8801800000000"  // Secondary phone number
+};
+const size_t authorizedNumberCount = sizeof(authorizedNumbers) / sizeof(authorizedNumbers[0]);
 
 // Timers
 unsigned long lastUpdateCheck = 0;
@@ -45,12 +45,12 @@ unsigned long lastWifiCheck = 0;
 const unsigned long wifiCheckInterval = 10000;
 
 // --- PIN DEFINITIONS ---
-#define RELAY_1 25
-#define RELAY_2 26
-#define relay_3 32 
-#define SWITCH_1 23
-#define SWITCH_2 22
-#define LED_PIN 2
+#define RELAY_1 25   // START Pulse Output
+#define RELAY_2 26   // STOP Pulse Output
+#define relay_3 32   // RESET Pulse Output
+#define SWITCH_1 23  // Motor Running Feedback Input (Contactor Aux NO -> GND)
+#define SWITCH_2 22  // Emergency Stop Switch Input (LOW = Normal, HIGH = Emergency)
+#define LED_PIN 2    // Built-in Status LED
 
 // --- SIM800L & DFPLAYER PINS ---
 #define ESP_RX_FROM_SIM800 16 
@@ -63,55 +63,34 @@ const unsigned long wifiCheckInterval = 10000;
 #define RELAY_TRIGGER HIGH
 #define RELAY_RELEASE LOW
 
-#define USE_PHYSICAL_SWITCH false
+// --- MOTOR FEEDBACK CONFIGURATION ---
+// When true, actual motor state is strictly validated via physical feedback pin (SWITCH_1)
+#define USE_PHYSICAL_FEEDBACK true
+#define FEEDBACK_ACTIVE_LEVEL LOW // LOW means contactor pulled in (motor running)
 
-// --- SPY STREAM FOR DTMF INTERCEPTION ---
-// This safely reads the SIM800L serial data to catch incoming calls and DTMF 
-// without stealing the internet data from TinyGSM.
-class SpyStream : public Stream {
-public:
-  HardwareSerial* target;
-  String buffer;
-  bool dtmf1 = false;
-  bool dtmf2 = false;
-  bool dtmf0 = false;
-  bool ring = false;
-  bool noCarrier = false;
-  
-  SpyStream(HardwareSerial* t) : target(t) { buffer.reserve(64); }
-  
-  int available() override { return target->available(); }
-  
-  int read() override { 
-    int c = target->read(); 
-    if (c >= 0) {
-      char ch = (char)c;
-      buffer += ch;
-      if (ch == '\n') {
-        if (buffer.indexOf("+DTMF: 1") != -1) dtmf1 = true;
-        else if (buffer.indexOf("+DTMF: 2") != -1) dtmf2 = true;
-        else if (buffer.indexOf("+DTMF: 0") != -1) dtmf0 = true;
-        else if (buffer.indexOf("RING") != -1) ring = true;
-        else if (buffer.indexOf("NO CARRIER") != -1) noCarrier = true;
-        buffer = "";
-      }
-      if (buffer.length() > 60) buffer = ""; // Prevent memory overflow
-    }
-    return c;
-  }
-  
-  int peek() override { return target->peek(); }
-  void flush() override { target->flush(); }
-  size_t write(uint8_t c) override { return target->write(c); }
-  size_t write(const uint8_t *buf, size_t size) override { return target->write(buf, size); }
+// --- SIM800L CALL & DTMF STATE (PURE SERIAL / NO GPRS) ---
+String simLineBuffer = "";
+bool simRingDetected = false;
+bool simNoCarrier = false;
+String simCallerNumber = "";
+char simLastDtmf = 0;
+bool simHasDtmf = false;
+
+// --- NON-BLOCKING CALL STATE MACHINE ---
+enum CallState {
+  CALL_IDLE,
+  CALL_RINGING,
+  CALL_ANSWERING,
+  CALL_CONNECTED,
+  CALL_HANGING_UP
 };
+CallState currentCallState = CALL_IDLE;
+unsigned long callTimer = 0;
+String activeCaller = "";
 
-// --- GLOBAL VARIABLES ---
+// --- GLOBAL CLIENTS ---
 WiFiClient espClient;
-SpyStream spySerial(&Serial1);
-TinyGsm modem(spySerial);
-TinyGsmClient gsmClient(modem);
-PubSubClient mqttClient;
+PubSubClient mqttClient(espClient);
 DFRobotDFPlayerMini myDFPlayer;
 
 String macAddress;
@@ -120,15 +99,16 @@ String topicCommand;
 
 int primaryFailCount = 0;
 bool useSecondaryBroker = false;
-bool isUsingGPRS = false; 
-bool gprsConnected = false; // Tracks actual PDP context status
-bool inCall = false;
-unsigned long callStartTime = 0;
 
 unsigned long relay1_timer = 0;
 unsigned long relay2_timer = 0;
 unsigned long relay3_timer = 0;
 const int relay_duration = 1000; 
+
+// Motor Feedback & Safety Variables
+String pendingVerificationState = "";
+unsigned long verificationStartTime = 0;
+String lastActionDescription = "System Boot";
 
 unsigned long lastStatusUpdate = 0;
 String lastMotorStat = "";
@@ -136,7 +116,7 @@ String lastSysMode = "";
 int lastWifiSignal = 0;
 
 unsigned long lastDebounceTime = 0;
-unsigned long debounceDelay = 200;
+const unsigned long debounceDelay = 200;
 String stableMotorState = "OFF";
 
 Ticker blinker;
@@ -148,8 +128,12 @@ void downloadAndApplyFirmware();
 bool startOTAUpdate(WiFiClient* client, int contentLength);
 void reconnectMQTT();
 void sendStatus();
+bool getActualMotorRunning();
+bool isAuthorizedCaller(const String& number);
+void processSimSerial();
+void parseSimLine(const String& line);
 
-// --- FUNCTIONS ---
+// --- HELPER FUNCTIONS ---
 
 void tick() {
   int state = digitalRead(LED_PIN);
@@ -162,22 +146,36 @@ void configModeCallback(WiFiManager *myWiFiManager) {
   blinker.attach(0.3, tick);
 }
 
-void sendStatus() {
-    String reading;
-    if (USE_PHYSICAL_SWITCH) {
-        reading = (digitalRead(SWITCH_1) == LOW) ? "ON" : "OFF";
-    } else {
-        reading = stableMotorState;
+// Check real motor physical state via contactor feedback
+bool getActualMotorRunning() {
+  if (USE_PHYSICAL_FEEDBACK) {
+    return (digitalRead(SWITCH_1) == FEEDBACK_ACTIVE_LEVEL);
+  } else {
+    return (stableMotorState == "ON");
+  }
+}
+
+// Check whether caller number is authorized in whitelist
+bool isAuthorizedCaller(const String& number) {
+  if (!enableCallerIdWhitelist) return true; // Whitelist disabled -> allow all
+  if (number.length() == 0) return false;     // Unknown caller ID -> reject if whitelist active
+
+  for (size_t i = 0; i < authorizedNumberCount; i++) {
+    String auth = authorizedNumbers[i];
+    if (number.indexOf(auth) != -1 || auth.indexOf(number) != -1) {
+      return true;
     }
+  }
+  return false;
+}
+
+// Send current status via MQTT (over WiFi)
+void sendStatus() {
+    // Read debounced feedback
+    String reading = getActualMotorRunning() ? "ON" : "OFF";
     String currentMode = (digitalRead(SWITCH_2) == LOW) ? "Normal" : "Emergency";
     
-    int currentSignal = 0;
-    if (isUsingGPRS) {
-        int csq = modem.getSignalQuality(); 
-        currentSignal = constrain(map(csq, 0, 31, 0, 100), 0, 100);
-    } else {
-        currentSignal = constrain(map(WiFi.RSSI(), -100, -30, 0, 100), 0, 100);
-    }
+    int currentSignal = constrain(map(WiFi.RSSI(), -100, -30, 0, 100), 0, 100);
 
     if (reading != stableMotorState) {
        if ((millis() - lastDebounceTime) > debounceDelay) {
@@ -198,10 +196,12 @@ void sendStatus() {
         JsonObject payload = doc.createNestedObject("payload");
         payload["motorStatus"] = currentMotor;
         payload["systemMode"] = currentMode;
+        payload["lastAction"] = lastActionDescription;
         payload["wifiSignal"] = currentSignal;
-        payload["localIP"] = isUsingGPRS ? modem.getLocalIP() : WiFi.localIP().toString();
+        payload["localIP"] = WiFi.localIP().toString();
         payload["version"] = currentFirmwareVersion;
-        payload["network"] = isUsingGPRS ? "SIM800L (GPRS)" : "WiFi";
+        payload["network"] = "WiFi";
+        payload["gsmMode"] = "Voice Calls Only (No GPRS)";
         
         String jsonString;
         serializeJson(doc, jsonString);
@@ -217,46 +217,95 @@ void sendStatus() {
     }
 }
 
+// Process control commands with safety interlocks & feedback validation
 void processCommand(String command) {
+    unsigned long now = millis();
+    bool isEmergencyActive = (digitalRead(SWITCH_2) == HIGH);
+
     if (command == "RELAY_1" || command == "ON" || command == "START") {
+        if (isEmergencyActive) {
+            Serial.println("[SAFETY] START Rejected: Emergency Stop switch is ACTIVE!");
+            lastActionDescription = "START Rejected (Emergency Active)";
+            lastStatusUpdate = 0;
+            return;
+        }
+        if (getActualMotorRunning()) {
+            Serial.println("[SAFETY] Motor is ALREADY RUNNING. START pulse ignored.");
+            lastActionDescription = "START Ignored (Already Running)";
+            lastStatusUpdate = 0;
+            return;
+        }
+
+        // Mutual Exclusion: Ensure STOP relay is strictly inactive
+        digitalWrite(RELAY_2, RELAY_RELEASE);
+        relay2_timer = 0;
+
+        // Pulse START Relay
         digitalWrite(RELAY_1, RELAY_TRIGGER);
-        relay1_timer = millis();
-        stableMotorState = "ON";
+        relay1_timer = now;
+        pendingVerificationState = "ON";
+        verificationStartTime = now;
+        lastActionDescription = "Starting Motor (Pulse Active)";
         Serial.println("[ACTION] RELAY_1 (START) Pulse Active -> HIGH for 1 sec");
-    } else if (command == "RELAY_2" || command == "OFF" || command == "STOP") {
+    } 
+    else if (command == "RELAY_2" || command == "OFF" || command == "STOP") {
+        if (!getActualMotorRunning() && stableMotorState == "OFF") {
+            Serial.println("[SAFETY] Motor is ALREADY STOPPED. STOP pulse ignored.");
+            lastActionDescription = "STOP Ignored (Already Stopped)";
+            lastStatusUpdate = 0;
+            return;
+        }
+
+        // Mutual Exclusion: Ensure START relay is strictly inactive
+        digitalWrite(RELAY_1, RELAY_RELEASE);
+        relay1_timer = 0;
+
+        // Pulse STOP Relay
         digitalWrite(RELAY_2, RELAY_TRIGGER);
-        relay2_timer = millis();
-        stableMotorState = "OFF";
+        relay2_timer = now;
+        pendingVerificationState = "OFF";
+        verificationStartTime = now;
+        lastActionDescription = "Stopping Motor (Pulse Active)";
         Serial.println("[ACTION] RELAY_2 (STOP) Pulse Active -> HIGH for 1 sec");
-    } else if (command == "RESET") {
+    } 
+    else if (command == "RESET") {
         digitalWrite(relay_3, RELAY_TRIGGER);
-        relay3_timer = millis();
+        relay3_timer = now;
+        lastActionDescription = "System Reset Pulse";
         Serial.println("[ACTION] RELAY_3 (RESET) Active -> HIGH for 1 sec");
-    } else if (command == "LED_ON") {
+    } 
+    else if (command == "LED_ON") {
         digitalWrite(LED_PIN, HIGH);
         Serial.println("[ACTION] Built-in LED turned ON remotely");
-    } else if (command == "LED_OFF") {
+    } 
+    else if (command == "LED_OFF") {
         digitalWrite(LED_PIN, LOW);
         Serial.println("[ACTION] Built-in LED turned OFF remotely");
-    } else if (command == "RESTART_ESP") {
+    } 
+    else if (command == "RESTART_ESP") {
         Serial.println("[ACTION] Restarting ESP32...");
         delay(500);
         ESP.restart();
-    } else if (command == "CHECK_UPDATE") {
-        Serial.println("[ACTION] Checking for firmware updates...");
-        if (isUsingGPRS) {
-            Serial.println("[WARN] OTA Updates are disabled over GPRS to prevent failure. Connect to WiFi first.");
-        } else {
-            checkForFirmwareUpdate();
-        }
+    } 
+    else if (command == "CHECK_UPDATE") {
+        Serial.println("[ACTION] Checking for firmware updates via WiFi...");
+        checkForFirmwareUpdate();
     }
     lastStatusUpdate = 0; 
 }
 
+// Safe MQTT Callback with payload size validation & strict command whitelist
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     esp_task_wdt_reset();
+
+    // Prevent buffer overflow from oversized payloads
+    if (length > 256) {
+        Serial.println("[MQTT SECURITY] Payload exceeds max allowed size (256 bytes). Dropping.");
+        return;
+    }
+
     String message = "";
-    for (int i = 0; i < length; i++) {
+    for (unsigned int i = 0; i < length; i++) {
         message += (char)payload[i];
     }
     
@@ -265,16 +314,25 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (String(topic) == topicCommand) {
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, message);
-        if (!error) {
+        if (!error && doc["command"].is<String>()) {
             String command = doc["command"].as<String>();
-            Serial.printf("[COMMAND] Processing: %s\n", command.c_str());
-            processCommand(command);
+
+            // Strict Command Whitelist Verification
+            if (command == "ON" || command == "OFF" || command == "START" || command == "STOP" || 
+                command == "RESET" || command == "LED_ON" || command == "LED_OFF" || 
+                command == "RESTART_ESP" || command == "CHECK_UPDATE") {
+                Serial.printf("[COMMAND] Authorized command processing: %s\n", command.c_str());
+                processCommand(command);
+            } else {
+                Serial.printf("[SECURITY] Rejected unrecognized command: %s\n", command.c_str());
+            }
+        } else {
+            Serial.println("[SECURITY] Malformed JSON payload received on command topic.");
         }
     }
 }
 
 unsigned long lastReconnectAttempt = 0;
-unsigned long lastGprsConnectAttempt = 0;
 
 void reconnectMQTT() {
     if (!mqttClient.connected()) {
@@ -286,12 +344,8 @@ void reconnectMQTT() {
         const char* broker = useSecondaryBroker ? mqtt_broker_2 : mqtt_broker_1;
         mqttClient.setServer(broker, mqtt_port);
         
-        Serial.print("Attempting MQTT connection to ");
-        Serial.print(broker);
-        Serial.print(" via ");
-        Serial.print(isUsingGPRS ? "GPRS (SIM)" : "WiFi");
-        Serial.print("...");
-        esp_task_wdt_reset(); // Reset WDT before potentially blocking connection
+        Serial.printf("Attempting MQTT connection to %s via WiFi...", broker);
+        esp_task_wdt_reset();
         
         if (mqttClient.connect(macAddress.c_str(), mqtt_user, mqtt_pass)) {
             Serial.println("connected");
@@ -307,23 +361,75 @@ void reconnectMQTT() {
             Serial.print(mqttClient.state());
             Serial.println(" try again in 5 seconds");
             
-            if (!useSecondaryBroker) {
-                primaryFailCount++;
-                if (primaryFailCount >= 3) {
-                    Serial.println("Primary broker failed 3 times. Switching to Secondary Broker!");
-                    useSecondaryBroker = true;
-                    primaryFailCount = 0; // Reset counter for secondary
-                }
-            } else {
-                primaryFailCount++;
-                Serial.println("Secondary broker failed.");
-                if (primaryFailCount >= 3) {
-                    Serial.println("Secondary broker failed 3 times. Switching back to Primary Broker!");
-                    useSecondaryBroker = false;
-                    primaryFailCount = 0;
-                }
+            primaryFailCount++;
+            if (!useSecondaryBroker && primaryFailCount >= 3) {
+                Serial.println("Primary broker failed 3 times. Switching to Secondary Broker!");
+                useSecondaryBroker = true;
+                primaryFailCount = 0;
+            } else if (useSecondaryBroker && primaryFailCount >= 3) {
+                Serial.println("Secondary broker failed 3 times. Switching back to Primary Broker!");
+                useSecondaryBroker = false;
+                primaryFailCount = 0;
             }
         }
+    }
+}
+
+// --- SIM800L SERIAL & AT COMMAND PARSER (CALLS & DTMF ONLY) ---
+
+void processSimSerial() {
+    while (Serial1.available()) {
+        char c = (char)Serial1.read();
+        if (c == '\r') continue;
+        if (c == '\n') {
+            if (simLineBuffer.length() > 0) {
+                parseSimLine(simLineBuffer);
+                simLineBuffer = "";
+            }
+        } else {
+            simLineBuffer += c;
+            if (simLineBuffer.length() > 80) simLineBuffer = "";
+        }
+    }
+}
+
+void parseSimLine(const String& line) {
+    Serial.printf("[SIM800L] %s\n", line.c_str());
+
+    // Detect incoming call ring
+    if (line.indexOf("RING") != -1) {
+        simRingDetected = true;
+    }
+    // Detect Caller ID: +CLIP: "017...",...
+    else if (line.indexOf("+CLIP:") != -1) {
+        int firstQuote = line.indexOf('"');
+        if (firstQuote != -1) {
+            int secondQuote = line.indexOf('"', firstQuote + 1);
+            if (secondQuote != -1) {
+                simCallerNumber = line.substring(firstQuote + 1, secondQuote);
+                simCallerNumber.trim();
+            }
+        }
+    }
+    // Detect DTMF key: +DTMF: 1
+    else if (line.indexOf("+DTMF:") != -1) {
+        int idx = line.indexOf("+DTMF:");
+        String keyStr = line.substring(idx + 6);
+        keyStr.trim();
+        if (keyStr.length() > 0) {
+            char k = keyStr[0];
+            if (k == '\'' || k == '"') {
+                if (keyStr.length() > 1) k = keyStr[1];
+            }
+            if ((k >= '0' && k <= '9') || k == '*' || k == '#') {
+                simLastDtmf = k;
+                simHasDtmf = true;
+            }
+        }
+    }
+    // Detect hangup / disconnect
+    else if (line.indexOf("NO CARRIER") != -1 || line.indexOf("BUSY") != -1 || line.indexOf("NO ANSWER") != -1) {
+        simNoCarrier = true;
     }
 }
 
@@ -334,15 +440,30 @@ void setup() {
     pinMode(RELAY_1, OUTPUT); digitalWrite(RELAY_1, RELAY_RELEASE);
     pinMode(RELAY_2, OUTPUT); digitalWrite(RELAY_2, RELAY_RELEASE);
     pinMode(relay_3, OUTPUT); digitalWrite(relay_3, RELAY_RELEASE);
-    pinMode(SWITCH_1, INPUT_PULLUP);
-    pinMode(SWITCH_2, INPUT_PULLUP);
+    pinMode(SWITCH_1, INPUT_PULLUP); // Contactor feedback
+    pinMode(SWITCH_2, INPUT_PULLUP); // Emergency switch
     pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
 
-    // Initialize SIM800L on Serial1
+    // Initialize SIM800L on Serial1 (Strictly for Calls & DTMF, NO GPRS)
     pinMode(SIM800_RST, OUTPUT);
     digitalWrite(SIM800_RST, HIGH);
     Serial1.begin(9600, SERIAL_8N1, ESP_RX_FROM_SIM800, ESP_TX_TO_SIM800);
-    Serial.println("SIM800L Serial1 Initialized");
+    Serial.println("SIM800L Serial1 Initialized (Calls & DTMF Only, No GPRS)");
+
+    // Pre-configure SIM800L audio, DTMF decoder and caller ID
+    delay(500);
+    Serial1.println("AT");
+    delay(100);
+    Serial1.println("ATE0");         // Echo OFF for cleaner serial parsing
+    delay(100);
+    Serial1.println("AT+CLIP=1");    // Enable Caller ID unsolicited result
+    delay(100);
+    Serial1.println("AT+DDET=1");    // Enable DTMF decoder
+    delay(100);
+    Serial1.println("AT+CLVL=100");   // Speaker volume 100%
+    delay(100);
+    Serial1.println("AT+CMIC=0,15");  // Microphone gain 15 (max)
+    delay(100);
 
     // Initialize DFPlayer on Serial2
     Serial2.begin(9600, SERIAL_8N1, ESP_RX_FROM_DFPLAYER, ESP_TX_TO_DFPLAYER);
@@ -350,7 +471,7 @@ void setup() {
         Serial.println(F("Unable to begin DFPlayer. Check connection/SD card."));
     } else {
         Serial.println(F("DFPlayer Mini Initialized."));
-        myDFPlayer.volume(25); // Volume (0~30)
+        myDFPlayer.volume(28); // Volume (0~30)
     }
 
     esp_task_wdt_deinit();
@@ -377,7 +498,7 @@ void setup() {
 
     Serial.println("Attempting WiFi Connection...");
     if (!wm.autoConnect("Mutho-Sech")) {
-        Serial.println("WiFi Failed to connect. Will fallback to SIM800L GPRS!");
+        Serial.println("WiFi Failed to connect. Will retry automatically.");
     } else {
         Serial.println("WiFi Connected!");
     }
@@ -407,162 +528,194 @@ void setup() {
     mqttClient.setSocketTimeout(15);
     mqttClient.setCallback(mqttCallback);
 
-    // Initial Network Selection
     if (WiFi.status() == WL_CONNECTED) {
-        mqttClient.setClient(espClient);
-        isUsingGPRS = false;
         checkForFirmwareUpdate();
-    } else {
-        mqttClient.setClient(gsmClient);
-        isUsingGPRS = true;
     }
 }
 
 void loop() {
     esp_task_wdt_reset();
+    processSimSerial();
+    unsigned long now = millis();
     
-    // --- PHONE CALL & DTMF (IVR) LOGIC ---
-    if (spySerial.ring) {
-        spySerial.ring = false;
-        inCall = true;
-        callStartTime = millis();
-        Serial.println("Incoming Call! Answering...");
-        modem.callAnswer();
-        
-        // Wait for call to connect, then enable DTMF detection
-        delay(1000);
-        modem.sendAT("+DDET=1");
-        modem.waitResponse();
+    // --- NON-BLOCKING PHONE CALL & DTMF STATE MACHINE ---
+    switch (currentCallState) {
+        case CALL_IDLE:
+            if (simRingDetected) {
+                simRingDetected = false;
+                activeCaller = simCallerNumber;
+                simCallerNumber = "";
+                Serial.printf("[CALL] Incoming call detected from: %s\n", activeCaller.length() > 0 ? activeCaller.c_str() : "Unknown");
 
-        // Play welcome audio (Ensure 0001.mp3 is on SD card)
-        myDFPlayer.play(1); 
-        Serial.println("Played Welcome Audio");
-    }
-    
-    if (spySerial.dtmf1) {
-        spySerial.dtmf1 = false;
-        Serial.println("DTMF 1 Received (Via Phone): START MOTOR");
-        processCommand("START");
-        myDFPlayer.play(2); // Play "Motor Started" audio (0002.mp3)
-    }
-    
-    if (spySerial.dtmf2) {
-        spySerial.dtmf2 = false;
-        Serial.println("DTMF 2 Received (Via Phone): STOP MOTOR");
-        processCommand("STOP");
-        myDFPlayer.play(3); // Play "Motor Stopped" audio (0003.mp3)
-    }
-    
-    if (spySerial.dtmf0) {
-        spySerial.dtmf0 = false;
-        inCall = false;
-        Serial.println("DTMF 0 Received (Via Phone): HANGING UP");
-        modem.callHangup();
-    }
-
-    if (spySerial.noCarrier) {
-        spySerial.noCarrier = false;
-        inCall = false;
-        Serial.println("Call Ended (NO CARRIER)");
-    }
-
-    // Failsafe to release inCall flag after 60 seconds
-    if (inCall && (millis() - callStartTime > 60000)) {
-        inCall = false;
-        Serial.println("Call Timeout. Releasing call state.");
-    }
-    
-    // --- NETWORK MANAGEMENT (Dual Failover) ---
-    if (WiFi.status() == WL_CONNECTED) {
-        if (isUsingGPRS) {
-            Serial.println("WiFi Restored. Switching from GPRS back to WiFi...");
-            isUsingGPRS = false;
-            mqttClient.disconnect();
-            mqttClient.setClient(espClient);
-        }
-    } else {
-        if (millis() - lastWifiCheck > wifiCheckInterval) {
-            lastWifiCheck = millis();
-            WiFi.reconnect();
-        }
-        
-        if (!isUsingGPRS) {
-            Serial.println("WiFi Lost. Switching to SIM800L GPRS...");
-            isUsingGPRS = true;
-            gprsConnected = false; // Reset to force GPRS initialization
-            mqttClient.disconnect();
-            mqttClient.setClient(gsmClient);
-        }
-
-        if (isUsingGPRS && (!gprsConnected || !modem.isGprsConnected())) {
-            if (millis() - lastGprsConnectAttempt > 10000) { 
-                lastGprsConnectAttempt = millis();
-                Serial.println("Initializing SIM800L and connecting to GPRS...");
-                
-                // Only restart modem if we are not in a voice call
-                if (!inCall) {
-                    if (modem.restart()) {
-                        esp_task_wdt_reset(); // Reset WDT after restart
-                        if (modem.waitForNetwork(60000)) {
-                            esp_task_wdt_reset(); // Reset WDT after network wait
-                            if (modem.gprsConnect(apn, gprsUser, gprsPass)) {
-                                Serial.println("GPRS Connected Successfully! Waiting 3s...");
-                                delay(3000); // Give modem time before TCP attempt
-                                gprsConnected = true;
-                            } else {
-                                Serial.println("GPRS Connect Failed!");
-                                gprsConnected = false;
-                            }
-                        }
-                    }
+                // Security: Verify Caller ID against whitelist
+                if (enableCallerIdWhitelist && !isAuthorizedCaller(activeCaller)) {
+                    Serial.println("[SECURITY] Unauthorized caller rejected! Hanging up...");
+                    Serial1.println("ATH");
+                    currentCallState = CALL_IDLE;
+                } else {
+                    Serial.println("[CALL] Answering call...");
+                    Serial1.println("ATA");
+                    currentCallState = CALL_ANSWERING;
+                    callTimer = now;
                 }
             }
+            break;
+
+        case CALL_ANSWERING:
+            // Non-blocking wait for 1 second for audio channel stabilization
+            if (now - callTimer >= 1000) {
+                Serial.println("[CALL] Call connected. Enabling DTMF and playing welcome audio...");
+                Serial1.println("AT+DDET=1");
+                Serial1.println("AT+CLVL=100");
+                Serial1.println("AT+CMIC=0,15");
+
+                myDFPlayer.volume(28);
+                myDFPlayer.play(1); // Track 1 (0001.mp3): Welcome & instruction prompt
+                currentCallState = CALL_CONNECTED;
+                callTimer = now; // Call duration tracker
+            }
+            break;
+
+        case CALL_CONNECTED:
+            // Check for DTMF keypresses
+            if (simHasDtmf) {
+                char key = simLastDtmf;
+                simHasDtmf = false;
+                Serial.printf("[DTMF] Received key: %c\n", key);
+
+                if (key == '1') {
+                    Serial.println("[IVR] 1 Pressed: START MOTOR");
+                    processCommand("START");
+                    myDFPlayer.play(2); // Track 2: Motor started confirmation
+                } 
+                else if (key == '2') {
+                    Serial.println("[IVR] 2 Pressed: STOP MOTOR");
+                    processCommand("STOP");
+                    myDFPlayer.play(3); // Track 3: Motor stopped confirmation
+                } 
+                else if (key == '3') {
+                    Serial.println("[IVR] 3 Pressed: MOTOR STATUS REPORT");
+                    if (getActualMotorRunning()) {
+                        Serial.println("[IVR] Motor is ON -> Playing Track 4");
+                        myDFPlayer.play(4); // Track 4: Motor is currently ON
+                    } else {
+                        Serial.println("[IVR] Motor is OFF -> Playing Track 5");
+                        myDFPlayer.play(5); // Track 5: Motor is currently OFF
+                    }
+                } 
+                else if (key == '0') {
+                    Serial.println("[IVR] 0 Pressed: HANGING UP CALL");
+                    currentCallState = CALL_HANGING_UP;
+                }
+            }
+
+            // Remote party hung up
+            if (simNoCarrier) {
+                simNoCarrier = false;
+                Serial.println("[CALL] Remote party hung up (NO CARRIER)");
+                currentCallState = CALL_HANGING_UP;
+            }
+
+            // Failsafe auto-hangup after 90 seconds
+            if (now - callTimer > 90000) {
+                Serial.println("[CALL] 90s timeout reached. Auto-hanging up.");
+                currentCallState = CALL_HANGING_UP;
+            }
+            break;
+
+        case CALL_HANGING_UP:
+            myDFPlayer.stop();
+            Serial1.println("ATH");
+            currentCallState = CALL_IDLE;
+            activeCaller = "";
+            simRingDetected = false;
+            simNoCarrier = false;
+            Serial.println("[CALL] Call terminated.");
+            break;
+    }
+
+    // --- MOTOR FEEDBACK VERIFICATION MONITOR ---
+    if (pendingVerificationState != "") {
+        if (now - verificationStartTime >= 3000) { // 3 seconds verification window
+            bool running = getActualMotorRunning();
+            if (pendingVerificationState == "ON") {
+                if (running) {
+                    lastActionDescription = "Motor Started (Contactor Verified)";
+                    Serial.println("[FEEDBACK SUCCESS] Contactor closed! Motor running confirmed.");
+                } else {
+                    lastActionDescription = "Start Failed (No Contactor Feedback)";
+                    Serial.println("[FEEDBACK FAILURE] Warning: Contactor did not close after START pulse!");
+                }
+            } else if (pendingVerificationState == "OFF") {
+                if (!running) {
+                    lastActionDescription = "Motor Stopped (Contactor Verified)";
+                    Serial.println("[FEEDBACK SUCCESS] Contactor opened! Motor stop confirmed.");
+                } else {
+                    lastActionDescription = "Stop Failed (Motor Still Running)";
+                    Serial.println("[FEEDBACK FAILURE] Warning: Contactor did not release after STOP pulse!");
+                }
+            }
+            pendingVerificationState = "";
+            lastStatusUpdate = 0; // Trigger instant dashboard update
         }
     }
 
-    // --- HANDLE MQTT ---
-    if ((!isUsingGPRS && WiFi.status() == WL_CONNECTED) || (isUsingGPRS && gprsConnected)) {
+    // --- WIFI & MQTT MANAGEMENT (Pure WiFi Only) ---
+    if (WiFi.status() == WL_CONNECTED) {
         if (!mqttClient.connected()) {
             reconnectMQTT();
         } else {
             mqttClient.loop();
         }
+    } else {
+        if (now - lastWifiCheck > wifiCheckInterval) {
+            lastWifiCheck = now;
+            Serial.println("[WIFI] Reconnecting to WiFi...");
+            WiFi.reconnect();
+        }
     }
 
     // --- HANDLE RELAY TIMERS ---
-    unsigned long currentMillis = millis();
-    if (relay1_timer > 0 && currentMillis - relay1_timer >= relay_duration) {
+    if (relay1_timer > 0 && now - relay1_timer >= relay_duration) {
         digitalWrite(RELAY_1, RELAY_RELEASE); 
         relay1_timer = 0;
         Serial.println("[ACTION] RELAY_1 (START) Pulse Ended");
     }
-    if (relay2_timer > 0 && currentMillis - relay2_timer >= relay_duration) {
+    if (relay2_timer > 0 && now - relay2_timer >= relay_duration) {
         digitalWrite(RELAY_2, RELAY_RELEASE); 
         relay2_timer = 0;
         Serial.println("[ACTION] RELAY_2 (STOP) Pulse Ended");
     }
-    if (relay3_timer > 0 && currentMillis - relay3_timer >= relay_duration) {
+    if (relay3_timer > 0 && now - relay3_timer >= relay_duration) {
         digitalWrite(relay_3, RELAY_RELEASE); 
         relay3_timer = 0;
         Serial.println("[ACTION] RELAY_3 (RESET) Pulse Ended");
     }
 
     // --- OTA CHECK (WiFi ONLY) ---
-    if (millis() - lastUpdateCheck > updateCheckInterval) {
-        lastUpdateCheck = millis();
-        if (!isUsingGPRS) {
+    if (now - lastUpdateCheck > updateCheckInterval) {
+        lastUpdateCheck = now;
+        if (WiFi.status() == WL_CONNECTED) {
             checkForFirmwareUpdate();
         }
     }
 
     // Check Status and Send Update
-    if (mqttClient.connected()) {
+    if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
         sendStatus();
     }
 }
 
-// --- OTA FUNCTIONS ---
+// --- SECURE OTA FUNCTIONS (WiFi ONLY) ---
+
+bool isValidVersionFormat(const String& ver) {
+    int ma = -1, mi = -1, pa = -1;
+    if (sscanf(ver.c_str(), "%d.%d.%d", &ma, &mi, &pa) != 3) return false;
+    return (ma >= 0 && mi >= 0 && pa >= 0);
+}
+
 bool isNewerVersion(String current, String latest) {
+    if (!isValidVersionFormat(latest)) return false;
     int c_major = 0, c_minor = 0, c_patch = 0;
     int l_major = 0, l_minor = 0, l_patch = 0;
     sscanf(current.c_str(), "%d.%d.%d", &c_major, &c_minor, &c_patch);
@@ -580,7 +733,10 @@ void checkForFirmwareUpdate() {
   String latestVersion = fetchLatestVersion();
   while (latestVersion.endsWith(".")) latestVersion.remove(latestVersion.length()-1);
   if (latestVersion == "") return;
+
   if (isNewerVersion(String(currentFirmwareVersion), latestVersion)) {
+    Serial.printf("[OTA] New version %s available (Current: %s). Initiating update via WiFi...\n", 
+                  latestVersion.c_str(), currentFirmwareVersion);
     esp_task_wdt_reset();
     downloadAndApplyFirmware();
   }
@@ -598,7 +754,9 @@ String fetchLatestVersion() {
     String latestVersion = http.getString();
     latestVersion.trim();
     http.end();
-    return latestVersion;
+    if (isValidVersionFormat(latestVersion)) {
+      return latestVersion;
+    }
   }
   http.end();
   return "";
@@ -615,43 +773,65 @@ void downloadAndApplyFirmware() {
   int httpCode = http.GET();
   if (httpCode == HTTP_CODE_OK) {
     int contentLength = http.getSize();
-    if (contentLength > 0) {
+    if (contentLength > 100000 && contentLength < 2000000) {
+      Serial.printf("[OTA] Valid firmware size confirmed: %d bytes. Writing to flash...\n", contentLength);
       WiFiClient* stream = http.getStreamPtr();
       if (startOTAUpdate(stream, contentLength)) {
+        Serial.println("[OTA SUCCESS] Firmware updated! Restarting ESP32...");
         delay(1000);
         ESP.restart();
       }
+    } else {
+      Serial.printf("[OTA REJECT] Invalid firmware binary size (%d bytes).\n", contentLength);
     }
   }
   http.end();
 }
 
 bool startOTAUpdate(WiFiClient* client, int contentLength) {
-  if (!Update.begin(contentLength)) return false;
+  if (!Update.begin(contentLength)) {
+    Serial.printf("[OTA ERROR] Not enough flash space for update: %s\n", Update.errorString());
+    return false;
+  }
+
   size_t written = 0;
   const unsigned long timeoutDuration = 120 * 1000;
   unsigned long lastDataTime = millis();
 
-  while (written < contentLength) {
+  while (written < (size_t)contentLength) {
     esp_task_wdt_reset();
     if (client->available()) {
       uint8_t buffer[256];
       size_t len = client->read(buffer, sizeof(buffer));
       if (len > 0) {
-        Update.write(buffer, len);
+        size_t writtenChunk = Update.write(buffer, len);
+        if (writtenChunk != len) {
+          Serial.printf("[OTA FLASH ERROR] Flash write failed! Expected %d, wrote %d\n", len, writtenChunk);
+          Update.abort();
+          return false;
+        }
         written += len;
         lastDataTime = millis();
       }
     }
     if (millis() - lastDataTime > timeoutDuration) {
+      Serial.println("[OTA ERROR] Stream timeout during download.");
       Update.abort();
       return false;
     }
     yield();
   }
-  if (written != contentLength) {
+
+  if (written != (size_t)contentLength) {
+    Serial.println("[OTA ERROR] Downloaded size mismatch.");
     Update.abort();
     return false;
   }
-  return Update.end();
+
+  if (!Update.end(true)) {
+    Serial.printf("[OTA ERROR] Update.end() failed: %s\n", Update.errorString());
+    return false;
+  }
+
+  return true;
 }
