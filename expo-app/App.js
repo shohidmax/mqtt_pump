@@ -70,6 +70,34 @@ export default function App() {
   const [loadingNumbers, setLoadingNumbers] = useState(false);
   const [addingNumber, setAddingNumber] = useState(false);
 
+  // --- Popup Confirmation Modal State ---
+  const [confirmModal, setConfirmModal] = useState({
+    isOpen: false,
+    title: '',
+    message: '',
+    confirmText: 'Confirm',
+    isDestructive: false,
+    onConfirm: null,
+  });
+
+  const openConfirm = ({ title, message, confirmText = 'Confirm', isDestructive = false, onConfirm }) => {
+    setConfirmModal({
+      isOpen: true,
+      title,
+      message,
+      confirmText,
+      isDestructive,
+      onConfirm: () => {
+        setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+        if (onConfirm) onConfirm();
+      },
+    });
+  };
+
+  const closeConfirm = () => {
+    setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+  };
+
   // Motor Gear Rotation Animation
   const spinAnim = useRef(new Animated.Value(0)).current;
   const wsRef = useRef(null);
@@ -225,14 +253,13 @@ export default function App() {
       }
     };
 
-    if (Platform.OS === 'web') {
-      if (window.confirm(`Delete "${name}"?`)) proceedDelete();
-    } else {
-      Alert.alert('Delete Device', `Are you sure you want to delete "${name}"?`, [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Delete', style: 'destructive', onPress: proceedDelete },
-      ]);
-    }
+    openConfirm({
+      title: 'Delete Device?',
+      message: `Are you sure you want to delete "${name}"? All associated settings and activity logs will be removed.`,
+      confirmText: 'Delete',
+      isDestructive: true,
+      onConfirm: proceedDelete,
+    });
   };
 
   const openEditModal = (device) => {
@@ -368,14 +395,13 @@ export default function App() {
         .catch((err) => console.log('Error deleting number:', err));
     };
 
-    if (Platform.OS === 'web') {
-      if (window.confirm(`Remove ${num} from authorized whitelist?`)) confirmAction();
-    } else {
-      Alert.alert('Remove Number', `Remove ${num} from authorized whitelist?`, [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Remove', style: 'destructive', onPress: confirmAction },
-      ]);
-    }
+    openConfirm({
+      title: 'Remove Number?',
+      message: `Are you sure you want to remove ${num} from the authorized whitelist?`,
+      confirmText: 'Remove',
+      isDestructive: true,
+      onConfirm: confirmAction,
+    });
   };
 
   const sendWsCommand = (cmd) => {
@@ -394,23 +420,37 @@ export default function App() {
     };
 
     if (cmd === 'RELAY_1') {
-      if (Platform.OS === 'web') {
-        if (window.confirm('Start the motor pump now?')) execute();
-      } else {
-        Alert.alert('Start Motor', 'Turn ON the motor pump now?', [
-          { text: 'Cancel', style: 'cancel' },
-          { text: 'START', onPress: execute },
-        ]);
-      }
+      openConfirm({
+        title: 'Start Motor Pump?',
+        message: 'Are you sure you want to turn ON the motor pump now?',
+        confirmText: 'START',
+        isDestructive: false,
+        onConfirm: execute,
+      });
     } else if (cmd === 'RELAY_2') {
-      if (Platform.OS === 'web') {
-        if (window.confirm('Stop the motor pump now?')) execute();
-      } else {
-        Alert.alert('Stop Motor', 'Turn OFF the motor pump now?', [
-          { text: 'Cancel', style: 'cancel' },
-          { text: 'STOP', style: 'destructive', onPress: execute },
-        ]);
-      }
+      openConfirm({
+        title: 'Stop Motor Pump?',
+        message: 'Are you sure you want to turn OFF the motor pump now?',
+        confirmText: 'STOP',
+        isDestructive: true,
+        onConfirm: execute,
+      });
+    } else if (cmd === 'CLEAR_LOGS') {
+      openConfirm({
+        title: 'Clear All Activity Logs?',
+        message: 'Are you sure you want to permanently delete all activity logs for this device?',
+        confirmText: 'Clear Logs',
+        isDestructive: true,
+        onConfirm: execute,
+      });
+    } else if (cmd === 'RESTART_ESP') {
+      openConfirm({
+        title: 'Reboot ESP32?',
+        message: 'Are you sure you want to remotely restart the ESP32?',
+        confirmText: 'Reboot',
+        isDestructive: true,
+        onConfirm: execute,
+      });
     } else {
       execute();
     }
@@ -1020,6 +1060,43 @@ export default function App() {
                 ) : (
                   <Text style={{ color: '#fff', fontWeight: '700' }}>Save Changes</Text>
                 )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Custom Popup Confirmation Modal */}
+      <Modal visible={confirmModal.isOpen} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalBox, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
+              <Ionicons
+                name={confirmModal.isDestructive ? 'alert-circle' : 'checkmark-circle'}
+                size={24}
+                color={confirmModal.isDestructive ? colors.error : colors.success}
+                style={{ marginRight: 8 }}
+              />
+              <Text style={[styles.modalTitle, { color: colors.text }]}>{confirmModal.title}</Text>
+            </View>
+            <Text style={[styles.modalSubtitle, { color: colors.subtext, marginTop: 4, marginBottom: 20, lineHeight: 18 }]}>
+              {confirmModal.message}
+            </Text>
+            <View style={styles.modalBtnRow}>
+              <TouchableOpacity
+                style={[styles.modalBtn, { borderWidth: 1, borderColor: colors.border }]}
+                onPress={closeConfirm}
+              >
+                <Text style={{ color: colors.text, fontWeight: '600' }}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.modalBtn,
+                  { backgroundColor: confirmModal.isDestructive ? colors.error : colors.success },
+                ]}
+                onPress={confirmModal.onConfirm}
+              >
+                <Text style={{ color: '#fff', fontWeight: '800' }}>{confirmModal.confirmText}</Text>
               </TouchableOpacity>
             </View>
           </View>
