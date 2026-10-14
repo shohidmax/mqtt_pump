@@ -39,6 +39,16 @@ const DeviceSchema = new mongoose.Schema({
         lastAction: { type: String, default: "System Boot" },
         lastUpdateTimestamp: { type: Date, default: Date.now }
     },
+    authorizedNumbers: { 
+        type: [String], 
+        default: [
+            "+8801793496030",
+            "+8801718677688",
+            "+8801728754140",
+            "+8801797723909",
+            "+8801723349796"
+        ] 
+    },
     createdAt: { type: Date, default: Date.now }
 });
 const Device = mongoose.model('Device', DeviceSchema);
@@ -350,7 +360,8 @@ app.get('/api/devices', async (req, res) => {
             name: d.deviceName,
             macAddress: d.macAddress,
             network: d.network,
-            currentStatus: d.currentStatus
+            currentStatus: d.currentStatus,
+            authorizedNumbers: d.authorizedNumbers || []
         }));
         res.json(formatted);
     } catch (err) {
@@ -403,6 +414,122 @@ app.delete('/api/devices/:id', async (req, res) => {
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: "Failed to delete device" });
+    }
+});
+
+// --- Phone Numbers Whitelist Endpoints ---
+const DEFAULT_AUTHORIZED_NUMBERS = [
+    "+8801793496030",
+    "+8801718677688",
+    "+8801728754140",
+    "+8801797723909",
+    "+8801723349796"
+];
+
+app.get('/api/devices/:mac/numbers', async (req, res) => {
+    try {
+        const mac = req.params.mac.toUpperCase();
+        let device = await Device.findOne({ macAddress: mac });
+        if (!device) {
+            device = await Device.findOneAndUpdate(
+                { macAddress: mac },
+                { 
+                    $setOnInsert: { 
+                        deviceName: "Smart Pump",
+                        authorizedNumbers: DEFAULT_AUTHORIZED_NUMBERS
+                    } 
+                },
+                { new: true, upsert: true }
+            );
+        } else if (!device.authorizedNumbers || device.authorizedNumbers.length === 0) {
+            device.authorizedNumbers = DEFAULT_AUTHORIZED_NUMBERS;
+            await device.save();
+        }
+        res.json(device.authorizedNumbers || DEFAULT_AUTHORIZED_NUMBERS);
+    } catch (err) {
+        res.status(500).json({ error: "Failed to fetch numbers" });
+    }
+});
+
+app.post('/api/devices/:mac/numbers', async (req, res) => {
+    try {
+        const mac = req.params.mac.toUpperCase();
+        let { number } = req.body;
+        if (!number) return res.status(400).json({ error: "Phone number is required" });
+        number = number.trim();
+
+        const device = await Device.findOneAndUpdate(
+            { macAddress: mac },
+            { $addToSet: { authorizedNumbers: number } },
+            { new: true, upsert: true }
+        );
+
+        // Notify Web Clients via WebSocket
+        webClients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({
+                    type: 'numbersUpdate',
+                    macAddress: mac,
+                    authorizedNumbers: device.authorizedNumbers
+                }));
+            }
+        });
+
+        // Forward to ESP32 via MQTT Command
+        if (mqttClient.connected) {
+            const topic = `device/${mac}/command`;
+            mqttClient.publish(topic, JSON.stringify({
+                command: "ADD_NUMBER",
+                number: number,
+                authorizedNumbers: device.authorizedNumbers
+            }), { qos: 1 });
+            console.log(`[MQTT] Published ADD_NUMBER ${number} to ${topic}`);
+        }
+
+        res.json(device.authorizedNumbers);
+    } catch (err) {
+        res.status(500).json({ error: "Failed to add number" });
+    }
+});
+
+app.delete('/api/devices/:mac/numbers/:number', async (req, res) => {
+    try {
+        const mac = req.params.mac.toUpperCase();
+        const number = decodeURIComponent(req.params.number).trim();
+
+        const device = await Device.findOneAndUpdate(
+            { macAddress: mac },
+            { $pull: { authorizedNumbers: number } },
+            { new: true }
+        );
+
+        if (!device) return res.status(404).json({ error: "Device not found" });
+
+        // Notify Web Clients via WebSocket
+        webClients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({
+                    type: 'numbersUpdate',
+                    macAddress: mac,
+                    authorizedNumbers: device.authorizedNumbers
+                }));
+            }
+        });
+
+        // Forward to ESP32 via MQTT Command
+        if (mqttClient.connected) {
+            const topic = `device/${mac}/command`;
+            mqttClient.publish(topic, JSON.stringify({
+                command: "DELETE_NUMBER",
+                number: number,
+                authorizedNumbers: device.authorizedNumbers
+            }), { qos: 1 });
+            console.log(`[MQTT] Published DELETE_NUMBER ${number} to ${topic}`);
+        }
+
+        res.json(device.authorizedNumbers);
+    } catch (err) {
+        res.status(500).json({ error: "Failed to delete number" });
     }
 });
 
